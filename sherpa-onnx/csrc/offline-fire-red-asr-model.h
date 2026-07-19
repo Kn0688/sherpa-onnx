@@ -70,13 +70,24 @@ class OfflineFireRedAsrModel {
 
   /** Return the initial self kv cache in a pair
    *  - n_layer_self_k_cache A 5-D tensor of shape
-   *                       (num_decoder_layers, N, max_len, num_head, head_dim).
+   *              (num_decoder_layers, batch_size, alloc_len, num_head, head_dim).
    *  - n_layer_self_v_cache A 5-D tensor of shape
-   *                       (num_decoder_layers, N, max_len, num_head, head_dim).
+   *              (num_decoder_layers, batch_size, alloc_len, num_head, head_dim).
+   *
+   * @param batch_size Number of utterances to decode in a batch.
+   * @param alloc_len Number of frames to allocate for the cache. If it is
+   *                  not positive or is larger than the model's max_len,
+   *                  then max_len is used.
    */
-  std::pair<Ort::Value, Ort::Value> GetInitialSelfKVCache() const;
+  std::pair<Ort::Value, Ort::Value> GetInitialSelfKVCache(
+      int32_t batch_size, int32_t alloc_len = -1) const;
 
   const OfflineFireRedAsrModelMetaData &GetModelMetadata() const;
+
+  /** Return true if the decoder model supports batch decoding, i.e., the
+   *  batch dimension of its tokens input is dynamic.
+   */
+  bool SupportBatch() const;
 
   /** Return an allocator for allocating memory
    */

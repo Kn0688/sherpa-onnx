@@ -14,7 +14,6 @@
 
 namespace sherpa_onnx {
 
-// Note: this functions works only for batch size == 1 at present
 std::vector<OfflineFireRedAsrDecoderResult>
 OfflineFireRedAsrGreedySearchDecoder::Decode(Ort::Value cross_k,
                                              Ort::Value cross_v,
@@ -24,27 +23,41 @@ OfflineFireRedAsrGreedySearchDecoder::Decode(Ort::Value cross_k,
   auto memory_info =
       Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
 
-  // For multilingual models, initial_tokens contains [sot, language, task]
-  //   - language is English by default
-  //   - task is transcribe by default
-  //
-  // For non-multilingual models, initial_tokens contains [sot]
-  std::array<int64_t, 2> token_shape = {1, 1};
-  int64_t token = meta_data.sos_id;
+  // cross_k is of shape (num_decoder_layers, N, T, d_model)
+  auto cross_k_shape = cross_k.GetTensorTypeAndShapeInfo().GetShape();
+  int32_t batch_size = static_cast<int32_t>(cross_k_shape[1]);
 
-  int32_t batch_size = 1;
+  std::array<int64_t, 2> token_shape = {batch_size, 1};
+  std::vector<int64_t> cur_token(batch_size, meta_data.sos_id);
 
   Ort::Value tokens = Ort::Value::CreateTensor(
-      memory_info, &token, 1, token_shape.data(), token_shape.size());
+      memory_info, cur_token.data(), cur_token.size(), token_shape.data(),
+      token_shape.size());
 
-  std::array<int64_t, 1> offset_shape{1};
+  std::array<int64_t, 1> offset_shape{batch_size};
   Ort::Value offset = Ort::Value::CreateTensor<int64_t>(
       model_->Allocator(), offset_shape.data(), offset_shape.size());
-  *(offset.GetTensorMutableData<int64_t>()) = 0;
+  int64_t *p_offset = offset.GetTensorMutableData<int64_t>();
+  std::fill(p_offset, p_offset + batch_size, 0);
 
-  std::vector<OfflineFireRedAsrDecoderResult> ans(1);
+  std::vector<OfflineFireRedAsrDecoderResult> ans(batch_size);
 
-  auto self_kv_cache = model_->GetInitialSelfKVCache();
+  // finished[b] is non-zero if the b-th utterance has predicted eos_id
+  std::vector<int32_t> finished(batch_size, 0);
+  int32_t num_finished = 0;
+
+  // assume at most 6 tokens per second
+  int32_t num_possible_tokens = num_feature_frames / 100.0 * 6;
+  num_possible_tokens =
+      std::min<int32_t>(num_possible_tokens, meta_data.max_len / 2);
+
+  // The self k/v cache is written only at positions [0, num_possible_tokens),
+  // so there is no need to allocate max_len frames for it. A smaller cache
+  // reduces both memory usage and decoding time. The margin 4 is more than
+  // enough since the write position is strictly less than num_possible_tokens.
+  int32_t cache_len = std::min(meta_data.max_len, num_possible_tokens + 4);
+
+  auto self_kv_cache = model_->GetInitialSelfKVCache(batch_size, cache_len);
 
   std::tuple<Ort::Value, Ort::Value, Ort::Value, Ort::Value, Ort::Value,
              Ort::Value>
@@ -55,12 +68,8 @@ OfflineFireRedAsrGreedySearchDecoder::Decode(Ort::Value cross_k,
                      std::move(cross_v),
                      std::move(offset)};
 
-  // assume at most 6 tokens per second
-  int32_t num_possible_tokens = num_feature_frames / 100.0 * 6;
-  num_possible_tokens =
-      std::min<int32_t>(num_possible_tokens, meta_data.max_len / 2);
-
-  for (int32_t i = 0; i < num_possible_tokens; ++i) {
+  for (int32_t i = 0;
+       i < num_possible_tokens && num_finished != batch_size; ++i) {
     decoder_out = model_->ForwardDecoder(View(&tokens),
                                          std::move(std::get<1>(decoder_out)),
                                          std::move(std::get<2>(decoder_out)),
@@ -74,18 +83,32 @@ OfflineFireRedAsrGreedySearchDecoder::Decode(Ort::Value cross_k,
     auto logits_shape = logits.GetTensorTypeAndShapeInfo().GetShape();
     int32_t vocab_size = logits_shape[2];
 
-    int32_t max_token_id = static_cast<int32_t>(std::distance(
-        p_logits, std::max_element(p_logits, p_logits + vocab_size)));
-    if (max_token_id == meta_data.eos_id) {
-      break;
+    for (int32_t b = 0; b != batch_size; ++b) {
+      if (finished[b]) {
+        // keep feeding eos_id to a finished utterance; its output is ignored
+        cur_token[b] = meta_data.eos_id;
+        continue;
+      }
+
+      const float *p = p_logits + b * vocab_size;
+      int32_t max_token_id = static_cast<int32_t>(
+          std::distance(p, std::max_element(p, p + vocab_size)));
+
+      cur_token[b] = max_token_id;
+      if (max_token_id == meta_data.eos_id) {
+        finished[b] = 1;
+        ++num_finished;
+      } else {
+        ans[b].tokens.push_back(max_token_id);
+      }
     }
 
-    ans[0].tokens.push_back(max_token_id);
-
-    token = max_token_id;
-
     // increment offset
-    *(std::get<5>(decoder_out).GetTensorMutableData<int64_t>()) += 1;
+    int64_t *p_cur_offset =
+        std::get<5>(decoder_out).GetTensorMutableData<int64_t>();
+    for (int32_t b = 0; b != batch_size; ++b) {
+      p_cur_offset[b] += 1;
+    }
   }
 
   return ans;

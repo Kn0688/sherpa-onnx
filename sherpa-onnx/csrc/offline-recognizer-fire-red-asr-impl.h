@@ -20,6 +20,7 @@
 #include "sherpa-onnx/csrc/offline-model-config.h"
 #include "sherpa-onnx/csrc/offline-recognizer-impl.h"
 #include "sherpa-onnx/csrc/offline-recognizer.h"
+#include "sherpa-onnx/csrc/pad-sequence.h"
 #include "sherpa-onnx/csrc/symbol-table.h"
 #include "sherpa-onnx/csrc/transpose.h"
 
@@ -91,46 +92,77 @@ class OfflineRecognizerFireRedAsrImpl : public OfflineRecognizerImpl {
   }
 
   void DecodeStreams(OfflineStream **ss, int32_t n) const override {
-    // batch decoding is not implemented yet
+    if (n > 1 && !model_->SupportBatch()) {
+      // The released FireRedASR decoder models hard-code a batch size of 1
+      // for the tokens input, so we fall back to decoding one stream at a
+      // time for such models.
+      for (int32_t i = 0; i != n; ++i) {
+        DecodeStreams(ss + i, 1);
+      }
+
+      return;
+    }
+
+    auto memory_info =
+        Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
+
+    int32_t feat_dim = ss[0]->FeatureDim();
+
+    std::vector<std::vector<float>> features_vec(n);
+    std::vector<Ort::Value> features;
+    features.reserve(n);
+
+    std::vector<int64_t> features_length_vec(n);
+
     for (int32_t i = 0; i != n; ++i) {
-      DecodeStream(ss[i]);
+      std::vector<float> f = ss[i]->GetFrames();
+      ApplyCMVN(&f);
+
+      int64_t num_frames = f.size() / feat_dim;
+      features_vec[i] = std::move(f);
+      features_length_vec[i] = num_frames;
+
+      std::array<int64_t, 2> shape{num_frames, feat_dim};
+
+      Ort::Value x = Ort::Value::CreateTensor(
+          memory_info, features_vec[i].data(), features_vec[i].size(),
+          shape.data(), shape.size());
+      features.push_back(std::move(x));
+    }
+
+    std::vector<const Ort::Value *> features_pointer(n);
+    for (int32_t i = 0; i != n; ++i) {
+      features_pointer[i] = &features[i];
+    }
+
+    Ort::Value x = PadSequence(model_->Allocator(), features_pointer, 0);
+
+    std::array<int64_t, 1> features_length_shape = {n};
+    Ort::Value x_length = Ort::Value::CreateTensor(
+        memory_info, features_length_vec.data(), features_length_vec.size(),
+        features_length_shape.data(), features_length_shape.size());
+
+    auto cross_kv = model_->ForwardEncoder(std::move(x), std::move(x_length));
+
+    int32_t max_num_frames = static_cast<int32_t>(*std::max_element(
+        features_length_vec.begin(), features_length_vec.end()));
+
+    auto results =
+        decoder_->Decode(std::move(cross_kv.first), std::move(cross_kv.second),
+                         max_num_frames);
+
+    for (int32_t i = 0; i != n; ++i) {
+      auto r = Convert(results[i], symbol_table_);
+
+      r.text = ApplyInverseTextNormalization(std::move(r.text));
+      r.text = ApplyHomophoneReplacer(std::move(r.text));
+      ss[i]->SetResult(r);
     }
   }
 
   OfflineRecognizerConfig GetConfig() const override { return config_; }
 
  private:
-  void DecodeStream(OfflineStream *s) const {
-    auto memory_info =
-        Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
-
-    int32_t feat_dim = s->FeatureDim();
-    std::vector<float> f = s->GetFrames();
-    ApplyCMVN(&f);
-
-    int64_t num_frames = f.size() / feat_dim;
-
-    std::array<int64_t, 3> shape{1, num_frames, feat_dim};
-
-    Ort::Value x = Ort::Value::CreateTensor(memory_info, f.data(), f.size(),
-                                            shape.data(), shape.size());
-
-    int64_t len_shape = 1;
-    Ort::Value x_len =
-        Ort::Value::CreateTensor(memory_info, &num_frames, 1, &len_shape, 1);
-
-    auto cross_kv = model_->ForwardEncoder(std::move(x), std::move(x_len));
-
-    auto results = decoder_->Decode(std::move(cross_kv.first),
-                                    std::move(cross_kv.second), num_frames);
-
-    auto r = Convert(results[0], symbol_table_);
-
-    r.text = ApplyInverseTextNormalization(std::move(r.text));
-    r.text = ApplyHomophoneReplacer(std::move(r.text));
-    s->SetResult(r);
-  }
-
   void ApplyCMVN(std::vector<float> *v) const {
     const auto &meta_data = model_->GetModelMetadata();
     const auto &mean_vec = meta_data.mean;
