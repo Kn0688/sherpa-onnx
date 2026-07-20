@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <utility>
 #include <vector>
@@ -25,6 +26,12 @@
 #include "sherpa-onnx/csrc/transpose.h"
 
 namespace sherpa_onnx {
+
+// When batching streams of different lengths, start a new bucket whenever
+// max_num_frames / min_num_frames within the current bucket would exceed
+// this ratio. Larger values allow more padding waste inside a batch;
+// smaller values create more, smaller batches.
+static constexpr float kMaxBucketLengthRatio = 1.2f;
 
 static OfflineRecognitionResult Convert(
     const OfflineFireRedAsrDecoderResult &src, const SymbolTable &sym_table) {
@@ -103,6 +110,66 @@ class OfflineRecognizerFireRedAsrImpl : public OfflineRecognizerImpl {
       return;
     }
 
+    if (n <= 1) {
+      DecodeStreamsBatch(ss, n);
+      return;
+    }
+
+    // Sort the streams by their number of feature frames and cut them into
+    // buckets of similar lengths, so that a short utterance is never padded
+    // to a much longer one. Padding waste is quadratic in the encoder and
+    // linear in the decoder cross-attention, so it dominates the batch cost
+    // for mixed lengths.
+    int32_t feat_dim = ss[0]->FeatureDim();
+    std::vector<int64_t> num_frames(n);
+    for (int32_t i = 0; i != n; ++i) {
+      num_frames[i] = ss[i]->GetFrames().size() / feat_dim;
+    }
+
+    std::vector<int32_t> order(n);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
+      return num_frames[a] < num_frames[b];
+    });
+
+    std::vector<OfflineStream *> bucket;
+    bucket.reserve(n);
+    int64_t bucket_min_frames = 0;
+    int32_t num_buckets = 0;
+    for (int32_t i = 0; i != n; ++i) {
+      if (!bucket.empty() &&
+          num_frames[order[i]] >
+              kMaxBucketLengthRatio * bucket_min_frames) {
+        if (config_.model_config.debug) {
+          SHERPA_ONNX_LOGE("FireRedASR bucket %d: %d streams, frames %d..%d",
+                           num_buckets, static_cast<int32_t>(bucket.size()),
+                           static_cast<int32_t>(bucket_min_frames),
+                           static_cast<int32_t>(num_frames[order[i - 1]]));
+        }
+        DecodeStreamsBatch(bucket.data(), bucket.size());
+        ++num_buckets;
+        bucket.clear();
+      }
+      if (bucket.empty()) {
+        bucket_min_frames = num_frames[order[i]];
+      }
+      bucket.push_back(ss[order[i]]);
+    }
+    if (!bucket.empty()) {
+      if (config_.model_config.debug) {
+        SHERPA_ONNX_LOGE("FireRedASR bucket %d: %d streams, frames %d..%d",
+                         num_buckets, static_cast<int32_t>(bucket.size()),
+                         static_cast<int32_t>(bucket_min_frames),
+                         static_cast<int32_t>(num_frames[order[n - 1]]));
+      }
+      DecodeStreamsBatch(bucket.data(), bucket.size());
+    }
+  }
+
+  OfflineRecognizerConfig GetConfig() const override { return config_; }
+
+ private:
+  void DecodeStreamsBatch(OfflineStream **ss, int32_t n) const {
     auto memory_info =
         Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
 
@@ -159,8 +226,6 @@ class OfflineRecognizerFireRedAsrImpl : public OfflineRecognizerImpl {
       ss[i]->SetResult(r);
     }
   }
-
-  OfflineRecognizerConfig GetConfig() const override { return config_; }
 
  private:
   void ApplyCMVN(std::vector<float> *v) const {

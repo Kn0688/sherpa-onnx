@@ -52,3 +52,26 @@ padding in a batch of 8).
 - single-file RTF (int8): 0.133 (10.1s) / 0.168 (17.6s); fp32: 0.43 / 0.36;
   the mask pass-through costs ~5% on batch-of-8 end-to-end
 - old released models (no cross_mask input) keep working unchanged
+
+## Length bucketing in sherpa-onnx (done)
+
+`OfflineRecognizerFireRedAsrImpl::DecodeStreams` sorts streams by frame
+count and cuts buckets at `kMaxBucketLengthRatio = 1.2` before batching
+(transparent to callers). Validated on the 8-file mixed set (4.7–17.6s,
+split into 4 buckets of 2+4+1+1): correctness 8/8 vs per-stream, bucketed
+batch ≈1.05x vs sequential (unbucketed mixed batch was 0.44x). Gains grow
+with bucket fullness; small ad-hoc sets stay near breakeven.
+
+## Conv quantization: measured dead ends
+
+- `quantize_dynamic` with `Conv` → `ConvInteger`: ~2x SLOWER than fp32 on
+  arm64 (no optimized kernel). Do not use.
+- `quantize-qdq-conv.py` (manual weight-only QDQ: per-output-channel int8 +
+  DequantizeLinear, compute stays fp32): verified 8/8 token-identical and
+  ConvInteger-free, but **~4% slower at runtime, NOT recommended** — a
+  single encoder forward amortizes weight-load bandwidth to ~nothing, so
+  dequantize overhead dominates. Kept in the repo only for disk-size
+  experiments (needs .data compaction to realize savings).
+- The earlier "official int8 is ~30% faster on short utterances" is already
+  closed by the slim decoder graph: this export is FASTER than the official
+  int8 everywhere (8% on 10s, 41% on 5s, 39% on 17.6s audio).
