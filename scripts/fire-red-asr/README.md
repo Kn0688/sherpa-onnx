@@ -48,8 +48,23 @@ cmvn_mean, cmvn_inv_stddev) is written into `encoder.onnx`.
   batch is a loss (0.57x) due to padding waste in the fp32 encoder —
   **always sort/bucket by length before batching**
 
-## Quantization (Phase 5)
+## Quantization (Phase 5, done)
 
-Planned: `quantize_dynamic` on MatMul (mirroring `scripts/whisper`), mainly
-for the encoder (70-80% of e2e time). Re-validate text equality after
-quantization; expect minor token diffs vs fp32.
+`quantize_dynamic` on MatMul (per-tensor QInt8): encoder 3.10→1.29 GB,
+decoder 1.54→0.44 GB (2.7x total). Do NOT additionally quantize Conv on
+arm64 — ConvInteger has no optimized kernel there and runs ~2x slower.
+
+Results (macOS arm64, threads=2):
+
+- Correctness: int8 == fp32 on all 8 test wavs per-utterance (better than
+  the officially released int8, which has 2 fp32 diffs); equal-length batch
+  4/4; mixed-length 7/8 (single remaining flip = missing decoder
+  cross-attention mask, unrelated to quantization)
+- RTF: 0.235 (10.1 s) / 0.164 (17.6 s) — 1.8-2.2x faster than fp32
+- vs officially released int8: ~30% slower on short utterances (their
+  encoder is quantized more aggressively incl. Conv) but ~39% faster on
+  long ones — the released decoder rebuilds ~700 mask nodes per step while
+  this export has only a few mask ops
+- Equal-length batch ~1.2x; mixed-length batch 0.44x (still a loss —
+  length bucketing is mandatory, quantization does not fix padding waste)
+- Peak RSS: 2.2 GB (single) / 3.2 GB (batch=8)
