@@ -147,9 +147,9 @@ class OfflineRecognizerFireRedAsrImpl : public OfflineRecognizerImpl {
     int32_t max_num_frames = static_cast<int32_t>(*std::max_element(
         features_length_vec.begin(), features_length_vec.end()));
 
-    auto results =
-        decoder_->Decode(std::move(cross_kv.first), std::move(cross_kv.second),
-                         max_num_frames);
+    auto results = decoder_->Decode(
+        std::move(std::get<0>(cross_kv)), std::move(std::get<1>(cross_kv)),
+        std::move(std::get<2>(cross_kv)), max_num_frames);
 
     for (int32_t i = 0; i != n; ++i) {
       auto r = Convert(results[i], symbol_table_);

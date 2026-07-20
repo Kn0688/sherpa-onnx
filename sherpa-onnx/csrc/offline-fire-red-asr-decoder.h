@@ -27,12 +27,16 @@ class OfflineFireRedAsrDecoder {
    *                              (num_decoder_layers, N, T, d_model).
    * @param n_layer_cross_v       A 4-D tensor of shape
    *                              (num_decoder_layers, N, T, d_model).
+   * @param enc_mask              A 2-D tensor of shape (N, T) with 1 for valid
+   *                              and 0 for padded encoder frames. It can be
+   *                              an empty Ort::Value if the encoder model
+   *                              does not provide it.
    *
    * @return Return a vector of size `N` containing the decoded results.
    */
   virtual std::vector<OfflineFireRedAsrDecoderResult> Decode(
       Ort::Value n_layer_cross_k, Ort::Value n_layer_cross_v,
-      int32_t num_feature_frames) = 0;
+      Ort::Value enc_mask, int32_t num_feature_frames) = 0;
 };
 
 }  // namespace sherpa_onnx

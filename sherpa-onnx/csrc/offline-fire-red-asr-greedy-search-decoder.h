@@ -18,7 +18,7 @@ class OfflineFireRedAsrGreedySearchDecoder : public OfflineFireRedAsrDecoder {
       : model_(model) {}
 
   std::vector<OfflineFireRedAsrDecoderResult> Decode(
-      Ort::Value cross_k, Ort::Value cross_v,
+      Ort::Value cross_k, Ort::Value cross_v, Ort::Value enc_mask,
       int32_t num_feature_frames) override;
 
  private:

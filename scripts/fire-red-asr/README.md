@@ -1,70 +1,54 @@
-# FireRedASR2-AED ONNX export (batch-capable)
+# FireRedASR2-AED ONNX export
 
-`export-onnx.py` re-exports [FireRedASR2-AED](https://www.modelscope.cn/models/FireRedTeam/FireRedASR2-AED)
-(PyTorch) to `encoder.onnx` + `decoder.onnx` with **dynamic batch dimensions**,
-fixing two limitations of the currently released sherpa-onnx models:
+Export https://github.com/FireRedTeam/FireRedASR2S (FireRedASR2-AED) to the
+encoder/decoder ONNX pair consumed by
+`sherpa-onnx/csrc/offline-fire-red-asr-model.cc`.
 
-1. `tokens`/`offset` inputs are fixed to batch=1 in the released decoder
-   (this export declares dynamic batch axes everywhere, so sherpa-onnx's
-   `SupportBatch()` detection enables true batched decoding).
-2. The released encoder does not mask self-attention with `x_len`, so
-   mixed-length batches are corrupted by padding. This export masks
-   self-attention with `x_len` (mixed-length batch went 2/8 → 7/8 vs
-   per-utterance results).
+Differences from the originally released `sherpa-onnx-fire-red-asr2-*` models:
 
-Known remaining limitation: the decoder cross-attention has no mask input,
-so heavily padded rows can still see garbage encoder frames (observed as a
-rare single-token flip). A cross-attention mask input is planned (Phase 2).
+1. **Dynamic batch** on every input (the released decoder hard-codes batch=1
+   in `tokens`/`offset`; `OfflineFireRedAsrModel::SupportBatch()` returns
+   false for it and sherpa falls back to per-stream decoding).
+2. **The encoder masks self-attention with `x_len`** (faithful to the official
+   PyTorch code; the released encoder did not, so valid frames were polluted
+   by padding in mixed-length batches).
+3. **Decoder cross-attention mask**: the encoder gains a third output
+   `enc_mask (N, Tc)` and the decoder gains an input `cross_mask (N, Tc)`;
+   padded encoder frames get a `-1e30` additive bias before the cross-attn
+   softmax. sherpa detects the `cross_mask` input by name and stays
+   backward-compatible with old models that do not have it.
 
 ## Usage
 
 ```bash
-python3 -m venv venv && source venv/bin/activate
-pip install torch onnx onnxruntime onnxscript soundfile kaldi_native_fbank modelscope
+pip install torch onnx onnxscript onnxruntime kaldiio
+git clone https://github.com/FireRedTeam/FireRedASR2S
+# download weights: https://www.modelscope.cn/models/FireRedTeam/FireRedASR2-AED
+# (model.pth.tar, cmvn.ark, dict.txt)
 
-# Download FireRedASR2-AED weights (model.pth.tar, ~4.7 GB) from
-# https://www.modelscope.cn/models/FireRedTeam/FireRedASR2-AED
-# and the official code from https://github.com/FireRedTeam/FireRedASR2S
+python3 ./scripts/fire-red-asr/export-onnx.py \
+  --repo ./FireRedASR2S \
+  --model-dir ./FireRedASR2-AED \
+  --output-dir ./out
 
-python3 export-onnx.py   # see the script's top-level constants for paths
+python3 ./scripts/fire-red-asr/quantize-int8.py --dir ./out
+# -> ./out/{encoder,decoder}.int8.onnx (+ .data)
 ```
 
-Outputs (fp32): `encoder.onnx` (+ external `.data`, ~3.1 GB),
-`decoder.onnx` (+ `.data`, ~1.5 GB), opset 18. Metadata required by
-sherpa-onnx (num_decoder_layers, num_head, head_dim, sos, eos, max_len,
-cmvn_mean, cmvn_inv_stddev) is written into `encoder.onnx`.
+Note: exporting requires `onnxscript` (torch dynamo exporter) and writes
+external-data `.data` files (models > 2GB). Do NOT add `Conv` to
+`op_types_to_quantize` on arm64 — ConvInteger is slower than fp32 Conv there.
 
-## Validation (macOS arm64, ORT 1.27)
+## Validation (2026-07, macOS arm64, num-threads=2)
 
-- Numerics vs official PyTorch: encoder cross_k/v max|Δ| ≈ 2e-5; decoder
-  logits max|Δ| ≤ 2.9e-5, identical argmax
-- batch=3 identical files: rows identical, match PyTorch ground truth
-- Equal-length batch: 4/4 == per-utterance
-- Mixed-length batch (padding up to 3.5x): 7/8 == per-utterance (released
-  model: 2/8); remaining diff traced to fp32-vs-int8 and one cross-attn
-  token flip
-- Speed with sherpa-onnx `fireredasr-batch-decoding` branch (fp32,
-  threads=2): equal-length batch=4 → 1.28x, batch=8 → ~1.5x; mixed-length
-  batch is a loss (0.57x) due to padding waste in the fp32 encoder —
-  **always sort/bucket by length before batching**
+Test set: 8 wavs from the released model package (mixed lengths, up to 3.5x
+padding in a batch of 8).
 
-## Quantization (Phase 5, done)
-
-`quantize_dynamic` on MatMul (per-tensor QInt8): encoder 3.10→1.29 GB,
-decoder 1.54→0.44 GB (2.7x total). Do NOT additionally quantize Conv on
-arm64 — ConvInteger has no optimized kernel there and runs ~2x slower.
-
-Results (macOS arm64, threads=2):
-
-- Correctness: int8 == fp32 on all 8 test wavs per-utterance (better than
-  the officially released int8, which has 2 fp32 diffs); equal-length batch
-  4/4; mixed-length 7/8 (single remaining flip = missing decoder
-  cross-attention mask, unrelated to quantization)
-- RTF: 0.235 (10.1 s) / 0.164 (17.6 s) — 1.8-2.2x faster than fp32
-- vs officially released int8: ~30% slower on short utterances (their
-  encoder is quantized more aggressively incl. Conv) but ~39% faster on
-  long ones — the released decoder rebuilds ~700 mask nodes per step while
-  this export has only a few mask ops
-- Equal-length batch ~1.2x; mixed-length batch 0.44x (still a loss —
-  length bucketing is mandatory, quantization does not fix padding waste)
-- Peak RSS: 2.2 GB (single) / 3.2 GB (batch=8)
+- mixed-length batch == per-stream: **8/8** (released model: 2/8;
+  pre-cross_mask re-export: 7/8 with one token flip from unmasked
+  cross-attention)
+- equal-length batch == per-stream: 4/4
+- int8 per-stream == fp32 per-stream: 8/8
+- single-file RTF (int8): 0.133 (10.1s) / 0.168 (17.6s); fp32: 0.43 / 0.36;
+  the mask pass-through costs ~5% on batch-of-8 end-to-end
+- old released models (no cross_mask input) keep working unchanged

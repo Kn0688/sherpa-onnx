@@ -17,6 +17,7 @@ namespace sherpa_onnx {
 std::vector<OfflineFireRedAsrDecoderResult>
 OfflineFireRedAsrGreedySearchDecoder::Decode(Ort::Value cross_k,
                                              Ort::Value cross_v,
+                                             Ort::Value enc_mask,
                                              int32_t num_feature_frames) {
   const auto &meta_data = model_->GetModelMetadata();
 
@@ -60,13 +61,14 @@ OfflineFireRedAsrGreedySearchDecoder::Decode(Ort::Value cross_k,
   auto self_kv_cache = model_->GetInitialSelfKVCache(batch_size, cache_len);
 
   std::tuple<Ort::Value, Ort::Value, Ort::Value, Ort::Value, Ort::Value,
-             Ort::Value>
+             Ort::Value, Ort::Value>
       decoder_out = {Ort::Value{nullptr},
                      std::move(self_kv_cache.first),
                      std::move(self_kv_cache.second),
                      std::move(cross_k),
                      std::move(cross_v),
-                     std::move(offset)};
+                     std::move(offset),
+                     std::move(enc_mask)};
 
   for (int32_t i = 0;
        i < num_possible_tokens && num_finished != batch_size; ++i) {
@@ -75,7 +77,8 @@ OfflineFireRedAsrGreedySearchDecoder::Decode(Ort::Value cross_k,
                                          std::move(std::get<2>(decoder_out)),
                                          std::move(std::get<3>(decoder_out)),
                                          std::move(std::get<4>(decoder_out)),
-                                         std::move(std::get<5>(decoder_out)));
+                                         std::move(std::get<5>(decoder_out)),
+                                         std::move(std::get<6>(decoder_out)));
 
     const auto &logits = std::get<0>(decoder_out);
     const float *p_logits = logits.GetTensorData<float>();
