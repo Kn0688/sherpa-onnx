@@ -18,6 +18,7 @@ namespace sherpa_onnx {
 std::vector<OfflineFireRedAsrDecoderResult>
 OfflineFireRedAsrGreedySearchDecoder::Decode(Ort::Value cross_k,
                                              Ort::Value cross_v,
+                                             Ort::Value enc_mask,
                                              int32_t num_feature_frames) {
   const auto &meta_data = model_->GetModelMetadata();
 
@@ -44,8 +45,9 @@ OfflineFireRedAsrGreedySearchDecoder::Decode(Ort::Value cross_k,
 
   std::vector<OfflineFireRedAsrDecoderResult> ans(1);
 
-  // assume at most 6 tokens per second
-  int32_t num_possible_tokens = num_feature_frames / 100.0 * 6;
+  // assume at most 8 tokens per second (raised from 6 for fast-speech
+  // headroom; costs ~31% larger cache and a few percent decoder time)
+  int32_t num_possible_tokens = num_feature_frames / 100.0 * 8;
   num_possible_tokens =
       std::min<int32_t>(num_possible_tokens, meta_data.max_len / 2);
 
@@ -55,16 +57,17 @@ OfflineFireRedAsrGreedySearchDecoder::Decode(Ort::Value cross_k,
   // the per-step cache I/O, which dominates the decoder cost.
   int32_t cache_len =
       std::min<int32_t>(meta_data.max_len, num_possible_tokens + 4);
-  auto self_kv_cache = model_->GetInitialSelfKVCache(cache_len);
+  auto self_kv_cache = model_->GetInitialSelfKVCache(1, cache_len);
 
   std::tuple<Ort::Value, Ort::Value, Ort::Value, Ort::Value, Ort::Value,
-             Ort::Value>
+             Ort::Value, Ort::Value>
       decoder_out = {Ort::Value{nullptr},
                      std::move(self_kv_cache.first),
                      std::move(self_kv_cache.second),
                      std::move(cross_k),
                      std::move(cross_v),
-                     std::move(offset)};
+                     std::move(offset),
+                     std::move(enc_mask)};
 
   for (int32_t i = 0; i < num_possible_tokens; ++i) {
     decoder_out = model_->ForwardDecoder(View(&tokens),
@@ -72,7 +75,8 @@ OfflineFireRedAsrGreedySearchDecoder::Decode(Ort::Value cross_k,
                                          std::move(std::get<2>(decoder_out)),
                                          std::move(std::get<3>(decoder_out)),
                                          std::move(std::get<4>(decoder_out)),
-                                         std::move(std::get<5>(decoder_out)));
+                                         std::move(std::get<5>(decoder_out)),
+                                         std::move(std::get<6>(decoder_out)));
 
     const auto &logits = std::get<0>(decoder_out);
     const float *p_logits = logits.GetTensorData<float>();

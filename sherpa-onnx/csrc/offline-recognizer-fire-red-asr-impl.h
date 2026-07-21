@@ -121,8 +121,10 @@ class OfflineRecognizerFireRedAsrImpl : public OfflineRecognizerImpl {
 
     auto cross_kv = model_->ForwardEncoder(std::move(x), std::move(x_len));
 
-    auto results = decoder_->Decode(std::move(cross_kv.first),
-                                    std::move(cross_kv.second), num_frames);
+    auto results = decoder_->Decode(std::move(std::get<0>(cross_kv)),
+                                    std::move(std::get<1>(cross_kv)),
+                                    std::move(std::get<2>(cross_kv)),
+                                    num_frames);
 
     auto r = Convert(results[0], symbol_table_);
 

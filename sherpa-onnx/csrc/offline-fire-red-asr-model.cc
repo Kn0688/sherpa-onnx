@@ -84,8 +84,8 @@ class OfflineFireRedAsrModel::Impl {
     InitCudaIOBinding();
   }
 
-  std::pair<Ort::Value, Ort::Value> ForwardEncoder(Ort::Value features,
-                                                   Ort::Value features_length) {
+  std::tuple<Ort::Value, Ort::Value, Ort::Value> ForwardEncoder(
+      Ort::Value features, Ort::Value features_length) {
     std::array<Ort::Value, 2> inputs{std::move(features),
                                      std::move(features_length)};
 
@@ -100,6 +100,11 @@ class OfflineFireRedAsrModel::Impl {
 
       binding.BindOutput(encoder_output_names_ptr_[0], *cuda_mem_info_);
       binding.BindOutput(encoder_output_names_ptr_[1], *cuda_mem_info_);
+      if (encoder_output_names_ptr_.size() > 2) {
+        // enc_mask is small; keep it on GPU as well since the decoder
+        // consumes it.
+        binding.BindOutput(encoder_output_names_ptr_[2], *cuda_mem_info_);
+      }
 
       binding.SynchronizeInputs();
       encoder_sess_->Run(Ort::RunOptions{nullptr}, binding);
@@ -111,20 +116,45 @@ class OfflineFireRedAsrModel::Impl {
           encoder_output_names_ptr_.data(), encoder_output_names_ptr_.size());
     }
 
-    return {std::move(encoder_out[0]), std::move(encoder_out[1])};
+    // Models exported before the cross_mask support have only 2 outputs.
+    Ort::Value enc_mask =
+        encoder_out.size() > 2 ? std::move(encoder_out[2]) : Ort::Value{};
+
+    return {std::move(encoder_out[0]), std::move(encoder_out[1]),
+            std::move(enc_mask)};
   }
 
   std::tuple<Ort::Value, Ort::Value, Ort::Value, Ort::Value, Ort::Value,
-             Ort::Value>
+             Ort::Value, Ort::Value>
   ForwardDecoder(Ort::Value tokens, Ort::Value n_layer_self_k_cache,
                  Ort::Value n_layer_self_v_cache, Ort::Value n_layer_cross_k,
-                 Ort::Value n_layer_cross_v, Ort::Value offset) {
-    std::array<Ort::Value, 6> decoder_input = {std::move(tokens),
-                                               std::move(n_layer_self_k_cache),
-                                               std::move(n_layer_self_v_cache),
-                                               std::move(n_layer_cross_k),
-                                               std::move(n_layer_cross_v),
-                                               std::move(offset)};
+                 Ort::Value n_layer_cross_v, Ort::Value offset,
+                 Ort::Value cross_mask) {
+    std::vector<Ort::Value> decoder_input;
+    decoder_input.reserve(7);
+    decoder_input.push_back(std::move(tokens));
+    decoder_input.push_back(std::move(n_layer_self_k_cache));
+    decoder_input.push_back(std::move(n_layer_self_v_cache));
+    decoder_input.push_back(std::move(n_layer_cross_k));
+    decoder_input.push_back(std::move(n_layer_cross_v));
+    decoder_input.push_back(std::move(offset));
+
+    if (has_cross_mask_input_) {
+      if (!cross_mask) {
+        // The decoder requires a cross_mask but the encoder did not provide
+        // one (mismatched model pair). Fall back to an all-ones mask so
+        // that behavior matches the pre-cross_mask models.
+        auto shape = decoder_input[3].GetTensorTypeAndShapeInfo().GetShape();
+        // cross_k is (num_decoder_layers, N, T, d_model)
+        std::array<int64_t, 2> mask_shape{shape[1], shape[2]};
+        cross_mask = Ort::Value::CreateTensor<float>(Allocator(),
+                                                     mask_shape.data(),
+                                                     mask_shape.size());
+        float *p = cross_mask.GetTensorMutableData<float>();
+        std::fill(p, p + shape[1] * shape[2], 1.0f);
+      }
+      decoder_input.push_back(std::move(cross_mask));
+    }
 
     std::vector<Ort::Value> decoder_out;
 
@@ -132,7 +162,7 @@ class OfflineFireRedAsrModel::Impl {
       // CPU-side sampling needs logits on CPU, while self KV cache should
       // remain on GPU to avoid large device<->host copies between decode steps.
       Ort::IoBinding binding(*decoder_sess_);
-      for (size_t i = 0; i < decoder_input.size(); ++i) {
+      for (size_t i = 0; i != decoder_input.size(); ++i) {
         binding.BindInput(decoder_input_names_ptr_[i], decoder_input[i]);
       }
 
@@ -151,19 +181,25 @@ class OfflineFireRedAsrModel::Impl {
           decoder_output_names_ptr_.size());
     }
 
+    Ort::Value cross_mask_out = Ort::Value{};
+    if (has_cross_mask_input_) {
+      cross_mask_out = std::move(decoder_input[6]);
+    }
+
     return std::tuple<Ort::Value, Ort::Value, Ort::Value, Ort::Value,
-                      Ort::Value, Ort::Value>{
+                      Ort::Value, Ort::Value, Ort::Value>{
         std::move(decoder_out[0]),   std::move(decoder_out[1]),
         std::move(decoder_out[2]),   std::move(decoder_input[3]),
-        std::move(decoder_input[4]), std::move(decoder_input[5])};
+        std::move(decoder_input[4]), std::move(decoder_input[5]),
+        std::move(cross_mask_out)};
   }
 
-  std::pair<Ort::Value, Ort::Value> GetInitialSelfKVCache(int32_t alloc_len) {
+  std::pair<Ort::Value, Ort::Value> GetInitialSelfKVCache(int32_t batch_size,
+                                                          int32_t alloc_len) {
     if (alloc_len <= 0 || alloc_len > meta_data_.max_len) {
       alloc_len = meta_data_.max_len;
     }
 
-    int32_t batch_size = 1;
     std::array<int64_t, 5> shape{meta_data_.num_decoder_layers, batch_size,
                                  alloc_len, meta_data_.num_head,
                                  meta_data_.head_dim};
@@ -190,6 +226,11 @@ class OfflineFireRedAsrModel::Impl {
   const OfflineFireRedAsrModelMetaData &GetModelMetadata() const {
     return meta_data_;
   }
+
+  // Return true if the decoder model supports batch decoding, i.e., the
+  // batch dimension of its tokens input is dynamic. Note that the released
+  // FireRedASR decoder models hard-code a batch size of 1 there.
+  bool SupportBatch() const { return support_batch_; }
 
  private:
   void InitEncoder(void *model_data, size_t model_data_length) {
@@ -252,6 +293,19 @@ class OfflineFireRedAsrModel::Impl {
 
     GetOutputNames(decoder_sess_.get(), &decoder_output_names_,
                    &decoder_output_names_ptr_);
+
+    for (size_t i = 0; i != decoder_input_names_.size(); ++i) {
+      if (decoder_input_names_[i] == "tokens") {
+        auto shape = decoder_sess_->GetInputTypeInfo(i)
+                         .GetTensorTypeAndShapeInfo()
+                         .GetShape();
+        // a dynamic batch dimension is -1
+        support_batch_ = !shape.empty() && shape[0] == -1;
+      }
+      if (decoder_input_names_[i] == "cross_mask") {
+        has_cross_mask_input_ = true;
+      }
+    }
   }
 
   void InitCudaIOBinding() {
@@ -292,6 +346,12 @@ class OfflineFireRedAsrModel::Impl {
   std::vector<const char *> decoder_output_names_ptr_;
 
   OfflineFireRedAsrModelMetaData meta_data_;
+
+  bool support_batch_ = false;
+
+  // true if the decoder model has a "cross_mask" input, i.e., it was
+  // exported with cross-attention padding mask support
+  bool has_cross_mask_input_ = false;
 };
 
 OfflineFireRedAsrModel::OfflineFireRedAsrModel(const OfflineModelConfig &config)
@@ -304,28 +364,31 @@ OfflineFireRedAsrModel::OfflineFireRedAsrModel(Manager *mgr,
 
 OfflineFireRedAsrModel::~OfflineFireRedAsrModel() = default;
 
-std::pair<Ort::Value, Ort::Value> OfflineFireRedAsrModel::ForwardEncoder(
-    Ort::Value features, Ort::Value features_length) const {
+std::tuple<Ort::Value, Ort::Value, Ort::Value>
+OfflineFireRedAsrModel::ForwardEncoder(Ort::Value features,
+                                       Ort::Value features_length) const {
   return impl_->ForwardEncoder(std::move(features), std::move(features_length));
 }
 
 std::tuple<Ort::Value, Ort::Value, Ort::Value, Ort::Value, Ort::Value,
-           Ort::Value>
+           Ort::Value, Ort::Value>
 OfflineFireRedAsrModel::ForwardDecoder(Ort::Value tokens,
                                        Ort::Value n_layer_self_k_cache,
                                        Ort::Value n_layer_self_v_cache,
                                        Ort::Value n_layer_cross_k,
                                        Ort::Value n_layer_cross_v,
-                                       Ort::Value offset) const {
+                                       Ort::Value offset,
+                                       Ort::Value cross_mask) const {
   return impl_->ForwardDecoder(
       std::move(tokens), std::move(n_layer_self_k_cache),
       std::move(n_layer_self_v_cache), std::move(n_layer_cross_k),
-      std::move(n_layer_cross_v), std::move(offset));
+      std::move(n_layer_cross_v), std::move(offset), std::move(cross_mask));
 }
 
 std::pair<Ort::Value, Ort::Value>
-OfflineFireRedAsrModel::GetInitialSelfKVCache(int32_t alloc_len) const {
-  return impl_->GetInitialSelfKVCache(alloc_len);
+OfflineFireRedAsrModel::GetInitialSelfKVCache(int32_t batch_size,
+                                              int32_t alloc_len) const {
+  return impl_->GetInitialSelfKVCache(batch_size, alloc_len);
 }
 
 OrtAllocator *OfflineFireRedAsrModel::Allocator() const {
@@ -335,6 +398,10 @@ OrtAllocator *OfflineFireRedAsrModel::Allocator() const {
 const OfflineFireRedAsrModelMetaData &OfflineFireRedAsrModel::GetModelMetadata()
     const {
   return impl_->GetModelMetadata();
+}
+
+bool OfflineFireRedAsrModel::SupportBatch() const {
+  return impl_->SupportBatch();
 }
 
 #if __ANDROID_API__ >= 9
