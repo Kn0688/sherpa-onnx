@@ -9,6 +9,8 @@ __pycache__
 dist/
 sherpa_onnx.egg-info/
 .DS_Store
+.vscode/
+compile_commands.json
 build-aarch64-linux-gnu
 build-arm-linux-gnueabihf
 sherpa-onnx-streaming-zipformer-*
