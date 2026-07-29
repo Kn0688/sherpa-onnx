@@ -220,7 +220,7 @@ class OfflineWhisperModel::Impl {
     Ort::Value tokens = Ort::Value::CreateTensor(
         memory_info, &token_val, 1, token_shape.data(), token_shape.size());
 
-    auto self_kv_cache = GetInitialSelfKVCache();
+    auto self_kv_cache = GetInitialSelfKVCache(0);
 
     std::array<int64_t, 1> offset_shape{1};
     Ort::Value offset = Ort::Value::CreateTensor<int64_t>(
@@ -259,8 +259,15 @@ class OfflineWhisperModel::Impl {
     return lang_id;
   }
 
-  std::pair<Ort::Value, Ort::Value> GetInitialSelfKVCache() {
-    std::array<int64_t, 4> shape{n_text_layer_, 1, n_text_ctx_, n_text_state_};
+  std::pair<Ort::Value, Ort::Value> GetInitialSelfKVCache(int32_t alloc_len) {
+    if (fixed_cache_len_ > 0) {
+      // The decoder graph hard-codes the cache length; we have to follow it.
+      alloc_len = fixed_cache_len_;
+    } else if (alloc_len <= 0 || alloc_len > n_text_ctx_) {
+      alloc_len = n_text_ctx_;
+    }
+
+    std::array<int64_t, 4> shape{n_text_layer_, 1, alloc_len, n_text_state_};
 
     Ort::Value n_layer_self_k_cache = Ort::Value::CreateTensor<float>(
         Allocator(), shape.data(), shape.size());
@@ -425,6 +432,23 @@ class OfflineWhisperModel::Impl {
                          n_alignment_heads_);
       }
     }
+
+    // Detect whether the self-attention KV cache length is hard-coded in the
+    // decoder graph. Some exported models (e.g., official whisper ONNX) fix
+    // in_n_layer_self_k_cache axis-2 to n_text_ctx; in that case we must
+    // always allocate the full cache. If the axis is dynamic (-1), we can
+    // use adaptive allocation.
+    for (size_t i = 0; i != decoder_input_names_.size(); ++i) {
+      if (decoder_input_names_[i] == "in_n_layer_self_k_cache") {
+        auto shape = decoder_sess_->GetInputTypeInfo(i)
+                         .GetTensorTypeAndShapeInfo()
+                         .GetShape();
+        if (shape.size() >= 3 && shape[2] > 0) {
+          fixed_cache_len_ = static_cast<int32_t>(shape[2]);
+        }
+        break;
+      }
+    }
   }
 
   void InitCudaIOBinding() {
@@ -496,6 +520,11 @@ class OfflineWhisperModel::Impl {
   // For cross-attention token-level timestamps
   bool has_attention_output_ = false;
   int32_t n_alignment_heads_ = 0;
+
+  // If > 0, the decoder model hard-codes the self-attention KV cache length
+  // (e.g., 448 for whisper-tiny). Adaptive allocation is disabled in that
+  // case and we always allocate this many frames.
+  int32_t fixed_cache_len_ = 0;
 };
 
 OfflineWhisperModel::OfflineWhisperModel(const OfflineModelConfig &config)
@@ -541,9 +570,9 @@ int32_t OfflineWhisperModel::DetectLanguage(Ort::Value &cross_k,    // NOLINT
   return impl_->DetectLanguage(cross_k, cross_v);
 }
 
-std::pair<Ort::Value, Ort::Value> OfflineWhisperModel::GetInitialSelfKVCache()
-    const {
-  return impl_->GetInitialSelfKVCache();
+std::pair<Ort::Value, Ort::Value> OfflineWhisperModel::GetInitialSelfKVCache(
+    int32_t alloc_len) const {
+  return impl_->GetInitialSelfKVCache(alloc_len);
 }
 
 OrtAllocator *OfflineWhisperModel::Allocator() const {
