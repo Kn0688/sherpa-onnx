@@ -82,11 +82,16 @@ class OfflineWhisperModel {
 
   /** Return the initial self kv cache in a pair
    *  - n_layer_self_k_cache A 4-D tensor of shape
-   *                         (n_text_layer, N, n_audio_ctx, n_text_state).
+   *                         (n_text_layer, N, alloc_len, n_text_state).
    *  - n_layer_self_v_cache A 4-D tensor of shape
-   *                         (n_text_layer, N, n_audio_ctx, n_text_state).
+   *                         (n_text_layer, N, alloc_len, n_text_state).
+   *
+   * @param alloc_len Length of the cache along the time axis. If it is 0 or
+   *                  negative, use n_text_ctx; otherwise, use
+   *                  min(alloc_len, n_text_ctx).
    */
-  std::pair<Ort::Value, Ort::Value> GetInitialSelfKVCache() const;
+  std::pair<Ort::Value, Ort::Value> GetInitialSelfKVCache(
+      int32_t alloc_len = 0) const;
   const std::vector<int64_t> &GetInitialTokens() const;
   const std::vector<int32_t> &GetAllLanguageIDs() const;
   const std::unordered_map<std::string, int32_t> &GetLang2ID() const;

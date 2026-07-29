@@ -118,7 +118,19 @@ OfflineWhisperGreedySearchDecoder::Decode(Ort::Value cross_k,
       model_->Allocator(), offset_shape.data(), offset_shape.size());
   *(offset.GetTensorMutableData<int64_t>()) = 0;
 
-  auto self_kv_cache = model_->GetInitialSelfKVCache();
+  // Estimate the maximum number of tokens to generate so that we can
+  // allocate a self-attention KV cache that is just large enough.
+  // Assuming at most 6 tokens per second, the decoder loop below runs at
+  // most num_possible_tokens steps, and each step advances the cache by 1.
+  // The +4 margin covers the initial prompt tokens and rounding.
+  int32_t num_possible_tokens = num_feature_frames / 100.0 * 6;
+  num_possible_tokens =
+      std::min<int32_t>(num_possible_tokens, model_->TextCtx() / 2);
+  num_possible_tokens = std::max<int32_t>(num_possible_tokens, 0);
+
+  int32_t cache_len =
+      std::min<int32_t>(model_->TextCtx(), num_possible_tokens + 4);
+  auto self_kv_cache = model_->GetInitialSelfKVCache(cache_len);
 
   auto decoder_out = model_->ForwardDecoder(
       std::move(tokens), std::move(self_kv_cache.first),
@@ -192,10 +204,6 @@ OfflineWhisperGreedySearchDecoder::Decode(Ort::Value cross_k,
       }
     }
   }
-
-  // assume at most 6 tokens per second
-  int32_t num_possible_tokens = num_feature_frames / 100.0 * 6;
-  num_possible_tokens = std::min<int32_t>(num_possible_tokens, n_text_ctx / 2);
 
   for (int32_t i = 0; i < num_possible_tokens; ++i) {
     if (max_token_id == eot) {
