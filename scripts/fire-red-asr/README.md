@@ -30,14 +30,67 @@ python3 ./scripts/fire-red-asr/export-onnx.py \
   --repo ./FireRedASR2S \
   --model-dir ./FireRedASR2-AED \
   --output-dir ./out
+# -> ./out/{encoder,decoder}.onnx (encoder already transformers-optimized,
+#    decoder already has merged Q/K/V)
 
 python3 ./scripts/fire-red-asr/quantize-int8.py --dir ./out
 # -> ./out/{encoder,decoder}.int8.onnx (+ .data)
+
+python3 ./scripts/fire-red-asr/quantize-int4.py --dir ./out
+# -> ./out/decoder.int4.onnx  (recommended decoder; keep the fp32
+#    transformers-optimized encoder, or encoder.int8.onnx)
 ```
 
 Note: exporting requires `onnxscript` (torch dynamo exporter) and writes
 external-data `.data` files (models > 2GB). Do NOT add `Conv` to
 `op_types_to_quantize` on arm64 — ConvInteger is slower than fp32 Conv there.
+
+## Optimizations
+
+### Encoder: ONNX Runtime transformers optimizer (28%)
+
+- **Why**: the Conformer encoder's Conv/MatMul graph from a naive export is
+  not laid out the way onnxruntime's CPU kernels like.
+- **How**: `export-onnx.py` runs
+  `onnxruntime.transformers.optimizer.optimize_model(model_type="bert",
+  num_heads=20, hidden_size=1280)` on the encoder right after export. The
+  rewrite is mathematically equivalent — encoder outputs are **bit-exact
+  identical** to the unoptimized model.
+- **Measured** (Apple Silicon): encoder 285 ms -> 205 ms on 3s audio
+  (**28%**, Conv time -43.5%). Gain is largest on short audio (28%),
+  smaller on long audio (~4%) where the decoder dominates.
+
+### Decoder: merged Q/K/V + MatMulNBits int4 (22% + half weight memory)
+
+- **Why**: each decoder step is an M=1 GEMV, i.e. memory-**bandwidth**
+  bound, and the three separate Q/K/V projections mean 3x the kernel
+  launches (96 small self-attn MatMuls across 16 layers).
+- **How**: (1) `export-onnx.py` pre-concatenates `w_qs/w_ks/w_vs` into one
+  `(3*D, D)` `w_qkv` per layer (the bias-less K projection gets a
+  zero-padded bias slice, so the merge is exact) and splits the result back
+  into Q/K/V — 96 -> 32 MatMuls, numerically verified against the original
+  projections (max abs err ~7e-6, float32 rounding). (2)
+  `quantize-int4.py` converts the fp32 decoder weights to int4 with
+  `MatMulNBitsQuantizer(bits=4, block_size=32, is_symmetric=True,
+  accuracy_level=4)`; `accuracy_level=4` selects the KleidiAI/NEON SQNBIT
+  GEMV ukernel. All decoder Linears have K=1280, and 1280 % 32 == 0.
+- **Measured** (Apple Silicon, vs original int8 decoder):
+
+  | config | decoder step | MatMul count | weights |
+  |--------|--------------|--------------|---------|
+  | int8 decoder | 7.491 ms | 193 | ~418 MB |
+  | int4 decoder | 6.001 ms (-20%) | 128 | ~209 MB |
+  | **merged QKV + int4** | **5.811 ms (-22%)** | **96** | **~209 MB** |
+
+- **Accuracy**: recognition output 100% token-identical to int8 on
+  test-10s/60s/120s/180s clips. End-to-end (optimized encoder + int4
+  decoder): 2.233s -> 1.280s on 10s audio (**43%**), ~5%/1% on 60s/120s
+  (encoder share dilutes the decoder gain).
+- **Caveats**: the input to `quantize-int4.py` must be the **fp32** decoder
+  (not an int8 one). Encoder int4 is intentionally not used — encoder
+  MatMuls are compute-bound GEMMs, so int4 only helps very short audio.
+  iOS xcframework builds of onnxruntime may lack KleidiAI; the plain NEON
+  kernel still works.
 
 ## Validation (2026-07, macOS arm64, num-threads=2)
 
