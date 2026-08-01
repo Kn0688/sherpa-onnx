@@ -181,3 +181,76 @@ sherpa-onnx-offline --num-threads=2 \
 - 移动端当前以稳定优先，暂不启用批量
 
 **服务端**可以直接使用完整能力：自适应 cache + 批量解码 + 长度分桶 + int8 量化。移动端保持单句解码，等待后续内存问题定位后再决定是否开启批量。
+
+## 12. 新增优化：Arena Shrinkage 与线程池指数退避（2026-08）
+
+### 12.1 Arena Shrinkage（内存稳定，替代定期重建 Recognizer）
+
+**问题**：ONNX Runtime 的 arena 内存只攒不还，长时间运行内存膨胀。之前的解决方案是"定期重建 Recognizer"，但需要销毁重建 session，重新加载 1.2GB 权重，代价高。
+
+**方案**：用 `memory.enable_memory_arena_shrinkage` 配置，每次 Run 后收缩 arena，**不用销毁重建 session**。
+
+**实现**（`sherpa-onnx/csrc/offline-fire-red-asr-model.cc`）：
+
+```cpp
+// 每 10 次 run 触发一次 arena shrinkage
+static constexpr int32_t kArenaShrinkageInterval = 10;
+
+Ort::RunOptions GetRunOptionsWithArenaShrinkage() {
+  Ort::RunOptions run_options;
+  run_count_++;
+  if (run_count_ % kArenaShrinkageInterval == 0) {
+    run_options.AddConfigEntry("memory.enable_memory_arena_shrinkage", "cpu:0");
+  }
+  return run_options;
+}
+```
+
+**优势**：
+
+- **不用销毁重建 session**：避免重新加载 1.2GB 权重
+- **代价更低**：只需要收缩 arena，不需要重新初始化
+- **性能几乎无损失**：每 10 次 run 触发一次，摊销开销
+
+**源码依据**：
+
+- `include/onnxruntime/core/session/onnxruntime_run_options_config_keys.h:27`：run option `memory.enable_memory_arena_shrinkage`
+- `onnxruntime/core/session/inference_session.cc:3229-3235` + `onnxruntime/core/framework/bfc_arena.cc:497-521`：每次 Run 后按设备列表收缩 arena 空闲块
+
+### 12.2 线程池指数退避（降低功耗和发热）
+
+**问题**：ONNX Runtime 的线程池在空闲时会自旋等待（spin loop），持续消耗 CPU，导致移动端发热和耗电。
+
+**方案**：启用线程池指数退避，让自旋等待的间隔越来越大（1, 2, 4, 8, ...），减少 CPU 消耗。
+
+**实现**（`sherpa-onnx/csrc/session.cc`）：
+
+```cpp
+// 在 GetSessionOptionsImpl 函数中
+sess_opts.AddConfigEntry("session.intra_op.spin_backoff_max", "8");
+sess_opts.AddConfigEntry("session.inter_op.spin_backoff_max", "8");
+```
+
+**原理**：
+
+- **固定间隔**：每次都 pause 1 次，CPU 消耗高
+- **指数退避**：pause 次数指数增长（1, 2, 4, 8, ...），CPU 消耗低
+- **响应速度影响小**：任务到来时，线程会很快被唤醒
+
+**效果**：
+
+- **降低功耗和发热**：CPU 空闲时消耗更少
+- **速度可能不变或略降**：对推理速度影响很小
+- **适用场景**：连续推理（VAD 分割 + 连续推理），线程池持续运行
+
+**源码依据**：
+
+- `onnxruntime/core/session/onnxruntime_session_options_config_keys.h:183-201`：config keys `session.intra_op.spin_backoff_max` 和 `session.inter_op.spin_backoff_max`
+- `onnxruntime/core/platform/EigenNonBlockingThreadPool.h`：指数退避实现
+
+**注意**：
+
+- 这个优化**不直接提升速度**，主要降低功耗和发热
+- 对单次推理时间短（<100ms）的场景作用有限
+- 对连续推理的场景（VAD 分割 + 连续推理）有用
+- 2 线程时仍有效，虽然效果不如多线程明显

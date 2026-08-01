@@ -107,13 +107,14 @@ class OfflineFireRedAsrModel::Impl {
       }
 
       binding.SynchronizeInputs();
-      encoder_sess_->Run(Ort::RunOptions{nullptr}, binding);
+      encoder_sess_->Run(GetRunOptionsWithArenaShrinkage(), binding);
       binding.SynchronizeOutputs();
       encoder_out = binding.GetOutputValues();
     } else {
       encoder_out = encoder_sess_->Run(
-          {}, encoder_input_names_ptr_.data(), inputs.data(), inputs.size(),
-          encoder_output_names_ptr_.data(), encoder_output_names_ptr_.size());
+          GetRunOptionsWithArenaShrinkage(), encoder_input_names_ptr_.data(),
+          inputs.data(), inputs.size(), encoder_output_names_ptr_.data(),
+          encoder_output_names_ptr_.size());
     }
 
     // Models exported before the cross_mask support have only 2 outputs.
@@ -171,13 +172,14 @@ class OfflineFireRedAsrModel::Impl {
       binding.BindOutput(decoder_output_names_ptr_[2], *cuda_mem_info_);
 
       binding.SynchronizeInputs();
-      decoder_sess_->Run(Ort::RunOptions{nullptr}, binding);
+      decoder_sess_->Run(GetRunOptionsWithArenaShrinkage(), binding);
       binding.SynchronizeOutputs();
       decoder_out = binding.GetOutputValues();
     } else {
       decoder_out = decoder_sess_->Run(
-          {}, decoder_input_names_ptr_.data(), decoder_input.data(),
-          decoder_input.size(), decoder_output_names_ptr_.data(),
+          GetRunOptionsWithArenaShrinkage(), decoder_input_names_ptr_.data(),
+          decoder_input.data(), decoder_input.size(),
+          decoder_output_names_ptr_.data(),
           decoder_output_names_ptr_.size());
     }
 
@@ -352,6 +354,24 @@ class OfflineFireRedAsrModel::Impl {
   // true if the decoder model has a "cross_mask" input, i.e., it was
   // exported with cross-attention padding mask support
   bool has_cross_mask_input_ = false;
+
+  // Run counter for arena shrinkage: every kArenaShrinkageInterval runs,
+  // trigger one arena shrinkage to keep memory stable without destroying
+  // the session (which would require reloading 1.2GB weights).
+  int32_t run_count_ = 0;
+  static constexpr int32_t kArenaShrinkageInterval = 10;
+
+  // Get RunOptions with arena shrinkage enabled every kArenaShrinkageInterval runs.
+  Ort::RunOptions GetRunOptionsWithArenaShrinkage() {
+    Ort::RunOptions run_options;
+    run_count_++;
+    if (run_count_ % kArenaShrinkageInterval == 0) {
+      // Shrink arena to free unused memory blocks back to the OS.
+      // This is cheaper than destroying and recreating the session.
+      run_options.AddConfigEntry("memory.enable_memory_arena_shrinkage", "cpu:0");
+    }
+    return run_options;
+  }
 };
 
 OfflineFireRedAsrModel::OfflineFireRedAsrModel(const OfflineModelConfig &config)

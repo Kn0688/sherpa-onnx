@@ -201,6 +201,18 @@ Ort::SessionOptions GetSessionOptionsImpl(
     config.erase("EnableCpuMemArena");
   }
 
+  // Enable thread pool exponential backoff to reduce CPU/power consumption
+  // during idle spin loops. This is especially useful on mobile platforms
+  // (iOS/Android) where power and thermal matter. The backoff makes the
+  // spin interval grow exponentially (1, 2, 4, 8, ...), reducing CPU usage
+  // when worker threads are idle between inference tasks.
+  //
+  // Reference: onnxruntime commit 5743f714b1
+  // Config keys: session.intra_op.spin_backoff_max, session.inter_op.spin_backoff_max
+  // Default value 1 means no backoff (fixed interval). Value 8 means max 8 pauses.
+  sess_opts.AddConfigEntry("session.intra_op.spin_backoff_max", "8");
+  sess_opts.AddConfigEntry("session.inter_op.spin_backoff_max", "8");
+
   // If you want to speed up initialization, please uncomment the following line
   // sess_opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_DISABLE_ALL);
 
