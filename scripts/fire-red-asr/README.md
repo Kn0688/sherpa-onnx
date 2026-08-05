@@ -30,15 +30,13 @@ python3 ./scripts/fire-red-asr/export-onnx.py \
   --repo ./FireRedASR2S \
   --model-dir ./FireRedASR2-AED \
   --output-dir ./out
-# -> ./out/{encoder,decoder}.onnx (encoder already transformers-optimized,
-#    decoder already has merged Q/K/V)
+# -> ./out/{encoder,decoder}.onnx (decoder already has merged Q/K/V)
 
 python3 ./scripts/fire-red-asr/quantize-int8.py --dir ./out
 # -> ./out/{encoder,decoder}.int8.onnx (+ .data)
 
 python3 ./scripts/fire-red-asr/quantize-int4.py --dir ./out
-# -> ./out/decoder.int4.onnx  (recommended decoder; keep the fp32
-#    transformers-optimized encoder, or encoder.int8.onnx)
+# -> ./out/decoder.int4.onnx  (recommended decoder; use encoder.int8.onnx)
 ```
 
 Note: exporting requires `onnxscript` (torch dynamo exporter) and writes
@@ -47,18 +45,15 @@ external-data `.data` files (models > 2GB). Do NOT add `Conv` to
 
 ## Optimizations
 
-### Encoder: ONNX Runtime transformers optimizer (28%)
+### Encoder: ONNX Runtime transformers optimizer (REMOVED - verified ineffective)
 
-- **Why**: the Conformer encoder's Conv/MatMul graph from a naive export is
-  not laid out the way onnxruntime's CPU kernels like.
-- **How**: `export-onnx.py` runs
-  `onnxruntime.transformers.optimizer.optimize_model(model_type="bert",
-  num_heads=20, hidden_size=1280)` on the encoder right after export. The
-  rewrite is mathematically equivalent — encoder outputs are **bit-exact
-  identical** to the unoptimized model.
-- **Measured** (Apple Silicon): encoder 285 ms -> 205 ms on 3s audio
-  (**28%**, Conv time -43.5%). Gain is largest on short audio (28%),
-  smaller on long audio (~4%) where the decoder dominates.
+- **Status**: **REMOVED** — strict A/B testing (no profiling, 50 runs) shows
+  the optimized encoder is **slower or equal** to the original int8 encoder
+  (-0.6% / -2.7% / -1.0% on 3s/10s/15s audio). The graph is almost identical
+  (1992 vs 1993 nodes, only 1 `Not` node difference), so the transformers
+  optimizer does not actually optimize the int8 model.
+- **Previous claim (28%) was a measurement error** caused by profiling
+  overhead in the test harness. Do NOT use this optimization.
 
 ### Decoder: merged Q/K/V + MatMulNBits int4 (22% + half weight memory)
 

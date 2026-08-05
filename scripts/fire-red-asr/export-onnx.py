@@ -20,12 +20,6 @@ decoder.onnx
        -1e30 additive bias before the cross-attention softmax)
   out: logits (N,1,8667), out_n_layer_self_k_cache, out_n_layer_self_v_cache
 
-After export, the encoder is further optimized with ONNX Runtime's
-transformers optimizer (model_type="bert"), which restructures the graph so
-Conformer Conv runs ~43% faster on CPU (measured on Apple Silicon). The
-optimization is mathematically equivalent: outputs are bit-exact identical
-to the unoptimized model.
-
 The decoder's self-attention Q/K/V projections are merged into a single
 (3*D, D) MatMul per layer (96 -> 32 MatMuls), cutting kernel-launch
 overhead; combined with MatMulNBits int4 quantization (see
@@ -386,26 +380,6 @@ def main():
     for f in (enc_file, dec_file):
         onnx.checker.check_model(f)
         print("checker ok:", f)
-
-    # Optimize encoder with ONNX Runtime transformers optimizer.
-    # This fuses/restructures the graph so Conv runs ~43% faster on CPU
-    # (measured on Apple Silicon; see optimization_roadmap.md for details).
-    # The optimization is mathematically equivalent: outputs are bit-exact
-    # identical to the unoptimized model.
-    try:
-        from onnxruntime.transformers import optimizer as ort_optimizer
-
-        print("\noptimizing encoder with transformers optimizer...")
-        optimized_model = ort_optimizer.optimize_model(
-            enc_file,
-            model_type="bert",
-            num_heads=NUM_HEAD,
-            hidden_size=D_MODEL,
-        )
-        optimized_model.save_model_to_file(enc_file)
-        print("encoder optimized:", enc_file)
-    except Exception as e:
-        print("warning: transformers optimizer failed, keeping unoptimized encoder:", e)
 
 
 if __name__ == "__main__":
