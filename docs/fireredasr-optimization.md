@@ -254,3 +254,40 @@ sess_opts.AddConfigEntry("session.inter_op.spin_backoff_max", "8");
 - 对单次推理时间短（<100ms）的场景作用有限
 - 对连续推理的场景（VAD 分割 + 连续推理）有用
 - 2 线程时仍有效，虽然效果不如多线程明显
+
+---
+
+## 13. 新增优化：Whisper 自适应 KV cache（2026-08）
+
+### 13.1 Whisper 自适应 self-attention KV cache 分配
+
+**问题**：Whisper 的 self-attention KV cache 按 `n_text_ctx` 满配分配，**每一步自回归都全量读写它**——而一句短音频只生成几个 token，大部分 cache I/O 是空转。
+
+**方案**：根据输入特征帧数预估 token 数，分配刚好够用的 cache：
+
+```cpp
+// 预估 token 数
+int32_t num_possible_tokens = num_feature_frames / 100.0 * 6;  // 每秒约6个token
+int32_t cache_len = min(n_text_ctx, num_possible_tokens + margin);
+
+// 动态分配 cache
+auto self_kv_cache = model_->GetInitialSelfKVCache(cache_len);
+```
+
+**兼容性**：如果 decoder 图硬编码了 cache 长度（如官方 whisper ONNX 模型固定为 `n_text_ctx`），检测到后回退到固定长度，保持兼容。
+
+**效果**：减少每步 decoder 内存带宽，特别是短音频片段。预期收益类似 FireRedASR 的自适应 cache（12~16%）。
+
+**修改的文件**：
+
+- `sherpa-onnx/csrc/offline-whisper-greedy-search-decoder.cc`
+- `sherpa-onnx/csrc/offline-whisper-model.cc`
+- `sherpa-onnx/csrc/offline-whisper-model.h`
+
+**提交**：`92258ec5 Whisper: adaptive self-attention KV cache allocation`
+
+**注意**：
+
+- 这个优化**不影响识别准确率**，只是减少 cache 分配，不改变计算
+- 对短音频片段收益更明显（cache 分配更小）
+- 对长音频片段收益较小（cache 分配接近满配）
