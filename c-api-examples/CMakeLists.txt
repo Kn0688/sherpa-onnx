@@ -88,6 +88,9 @@ target_link_libraries(add-punctuation-online-c-api sherpa-onnx-c-api)
 add_executable(whisper-c-api whisper-c-api.c)
 target_link_libraries(whisper-c-api sherpa-onnx-c-api)
 
+add_executable(whisper-bench-c-api whisper-bench-c-api.c)
+target_link_libraries(whisper-bench-c-api sherpa-onnx-c-api)
+
 add_executable(fire-red-asr-c-api fire-red-asr-c-api.c)
 target_link_libraries(fire-red-asr-c-api sherpa-onnx-c-api)
 

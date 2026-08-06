@@ -617,11 +617,12 @@ def main():
         output_names=["logits", "out_n_layer_self_k_cache", "out_n_layer_self_v_cache"],
         dynamic_axes={
             "tokens": {0: "n_audio", 1: "n_tokens"},
-            "in_n_layer_self_k_cache": {1: "n_audio"},
-            "in_n_layer_self_v_cache": {1: "n_audio"},
+            "in_n_layer_self_k_cache": {1: "n_audio", 2: "n_text_ctx"},
+            "in_n_layer_self_v_cache": {1: "n_audio", 2: "n_text_ctx"},
             "n_layer_cross_k": {1: "n_audio", 2: "T"},
             "n_layer_cross_v": {1: "n_audio", 2: "T"},
         },
+        dynamo=False,
     )
 
     if "large" in args.model:
