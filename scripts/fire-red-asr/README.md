@@ -30,7 +30,9 @@ python3 ./scripts/fire-red-asr/export-onnx.py \
   --repo ./FireRedASR2S \
   --model-dir ./FireRedASR2-AED \
   --output-dir ./out
-# -> ./out/{encoder,decoder}.onnx (decoder already has merged Q/K/V)
+# -> ./out/{encoder,decoder}.onnx (decoder has merged Q/K/V; encoder has its
+#    32 pointwise convs rewritten to MatMul so int8 quantizes them to sdot —
+#    see "Encoder: pointwise conv -> MatMul" below. Always on.)
 
 python3 ./scripts/fire-red-asr/quantize-int8.py --dir ./out
 # -> ./out/{encoder,decoder}.int8.onnx (+ .data)
@@ -44,6 +46,54 @@ external-data `.data` files (models > 2GB). Do NOT add `Conv` to
 `op_types_to_quantize` on arm64 — ConvInteger is slower than fp32 Conv there.
 
 ## Optimizations
+
+### Encoder: pointwise conv -> MatMul at export time (default) — int8 ~30% faster, ~37% smaller, token-identical
+
+`export-onnx.py` rewrites the Conformer conv module's 32 pointwise (1x1,
+bias-free) Conv1d — `pointwise_conv1` (1280->5120) and `pointwise_conv2`
+(2560->1280), 16 layers each — as `Transpose + MatMul + Transpose`. This is
+**always on** (not a flag): it is a prerequisite for a fast int8 encoder, not
+an optional tweak.
+
+- **Why**: `quantize-int8.py` quantizes MatMul but deliberately NOT Conv
+  (ConvInteger has no fast arm64 kernel, ~2x slower than fp32 — see the Note
+  above). Left as Conv, these 32 layers stay **fp32** through int8
+  quantization and become the int8 encoder's bottleneck (both compute and
+  size). Rewritten to MatMul, `quantize_dynamic` lowers them to int8
+  `MatMulInteger`, which uses the arm64 sdot ukernel.
+- **How / layout**: Conv1d is NCW — `out[n,o,t] = sum_i W[o,i,0]*in[n,i,t]`.
+  Equivalent MatMul: transpose in to (N,T,Cin), matmul by W2(Cin,Cout) ->
+  (N,T,Cout), transpose back. Weight (O,I,1) -> (I,O).
+- **CRITICAL — weight must be MatMul input[1]**: `quantize_dynamic` hard-codes
+  input[0]=activation, input[1]=weight
+  (onnxruntime `quantization/operators/matmul.py`), and with
+  `MatMulConstBOnly=True` (the dynamic default) only quantizes a MatMul whose
+  input[1] is a constant initializer. So `x @ W` (weight on input[1]) IS
+  quantized to int8; the cleaner-looking `W @ x` (weight on input[0]) would
+  NOT be. Keep W on the right.
+- **Measured** (Apple M3 Pro, arm64, strict interleaved A/B vs the original
+  int8 encoder with fp32 convs, 41 runs/config, no profiling):
+
+  | metric | original int8 | conv->MatMul int8 | gain |
+  |--------|--------------|-------------------|------|
+  | speed (median, threads=1) | baseline | — | **-30.0%** (3s/10s/17s: -31.0/-31.2/-30.1) |
+  | speed (median, threads=4) | baseline | — | **-29.4%** (3s/10s/17s: -29.0/-30.0/-27.3) |
+  | encoder live weights | 1292 MB | 820 MB | **-36.5%** |
+  | recognition | — | — | token-identical, CER 0.0 on 8 wavs |
+
+- **Where the 472 MB goes**: the 32 conv weights (688 MB of the fp32 total)
+  become int8 (fp32 688->59 MB, int8 604->761 MB); same weights at 1/4 the
+  bytes.
+- **Not bit-exact** vs Conv (fp32 accumulation order differs), but the fp32
+  graph is verified cos=1.0 / max|Δ|=7.6e-6 vs the Conv encoder, and int8
+  end-to-end is token-identical (8 wavs: zh/en-mixed, Mandarin, Sichuan,
+  Tianjin, Henan dialects, 8k).
+- **Timing is what matters**: the SAME conv->MatMul rewrite applied
+  **post-quantization** (on `encoder.int8.onnx`) is a no-op rename — the convs
+  are already fp32 there and ORT's CPU already lowers 1x1 conv to a GEMM, so it
+  is speed-neutral. The gain exists ONLY when the rewrite happens **before**
+  quantization — i.e. here, at export — so that `quantize_dynamic` actually
+  turns these 32 layers into int8 MatMulInteger.
 
 ### Encoder: ONNX Runtime transformers optimizer (REMOVED - verified ineffective)
 
@@ -111,6 +161,11 @@ batch ≈1.05x vs sequential (unbucketed mixed batch was 0.44x). Gains grow
 with bucket fullness; small ad-hoc sets stay near breakeven.
 
 ## Conv quantization: measured dead ends
+
+These are dead ends for quantizing conv **as conv**. The path that DOES work —
+rewrite the pointwise convs to MatMul before quantization so they become
+`MatMulInteger` (sdot) instead of `ConvInteger` — is the first section above
+("Encoder: pointwise conv -> MatMul at export time").
 
 - `quantize_dynamic` with `Conv` → `ConvInteger`: ~2x SLOWER than fp32 on
   arm64 (no optimized kernel). Do not use.

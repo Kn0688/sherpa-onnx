@@ -86,6 +86,87 @@ def rel_pos_emb(pe: torch.Tensor, T: int) -> torch.Tensor:
     return pe.narrow(1, c - T + 1, 2 * T - 1)
 
 
+def rewrite_pointwise_conv(enc_file):
+    """Rewrite the encoder's pointwise (1x1, no-bias) Conv1d as
+    Transpose + MatMul + Transpose, in place on enc_file.
+
+    Why: the Conformer conv module has two pointwise convs per layer
+    (pointwise_conv1 1280->5120, pointwise_conv2 2560->1280; 32 total, all
+    bias-free). onnxruntime's quantize_dynamic quantizes MatMul but NOT Conv on
+    arm64 (ConvInteger has no fast kernel there, ~2x slower than fp32 — see
+    quantize-int8.py). Rewriting each pointwise conv to a MatMul lets
+    quantize_dynamic lower it to MatMulInteger, which uses the arm64 sdot
+    ukernel. Measured: ~30%% faster int8 encoder, recognition token-identical.
+
+    Layout: Conv1d is NCW — in (N,Cin,T), out (N,Cout,T),
+        out[n,o,t] = sum_i W[o,i,0] * in[n,i,t]
+    MatMul form: transpose in -> (N,T,Cin), matmul by W2(Cin,Cout) ->
+    (N,T,Cout), transpose back -> (N,Cout,T). Weight (O,I,1) -> (I,O).
+
+    CRITICAL: the activation is MatMul input[0] and the weight is input[1].
+    quantize_dynamic hard-codes input[0]=activation, input[1]=weight
+    (onnxruntime .../operators/matmul.py MatMulInteger.quantize) AND with
+    MatMulConstBOnly=True (the dynamic default) only quantizes when input[1] is
+    a constant initializer. So `x @ W` (weight on input[1]) IS quantized; the
+    cleaner-looking `W @ x` (weight on input[0]) would NOT be. Keep W on the
+    right.
+
+    NOT bit-exact vs the Conv (fp32 accumulation order differs), but the fp32
+    graph is verified token-identical downstream, matching sherpa's own
+    optimize-encoder.py conv pass.
+    """
+    from onnx import numpy_helper
+
+    model = onnx.load(enc_file, load_external_data=True)
+    g = model.graph
+    inits = {t.name: t for t in g.initializer}
+
+    pw = []
+    for n in g.node:
+        if n.op_type == "Conv" and len(n.input) == 2:
+            w = n.input[1]
+            if w in inits and len(inits[w].dims) == 3 and inits[w].dims[2] == 1:
+                pw.append(n)
+    if not pw:
+        print("  rewrite_pointwise_conv: no pointwise Conv found, skipped")
+        return
+
+    pw_set = set(id(n) for n in pw)
+    new_nodes = []
+    new_inits = list(g.initializer)
+    rm = set()
+    for n in g.node:
+        if id(n) not in pw_set:
+            new_nodes.append(n)
+            continue
+        x, w, y, base = n.input[0], n.input[1], n.output[0], n.name
+        warr = numpy_helper.to_array(inits[w])            # (O,I,1)
+        O, I, _ = warr.shape
+        w2 = np.ascontiguousarray(warr.reshape(O, I).T)   # (I,O) -> weight on input[1]
+        w2_name = base + "_w_IO"
+        new_inits.append(numpy_helper.from_array(w2.astype(np.float32), w2_name))
+        rm.add(w)
+        ntc = base + "_ntc"
+        new_nodes.append(onnx.helper.make_node(
+            "Transpose", [x], [ntc], name=base + "_pre", perm=[0, 2, 1]))
+        nto = base + "_nto"
+        new_nodes.append(onnx.helper.make_node(
+            "MatMul", [ntc, w2_name], [nto], name=base + "_mm"))
+        new_nodes.append(onnx.helper.make_node(
+            "Transpose", [nto], [y], name=base + "_post", perm=[0, 2, 1]))
+
+    del g.node[:]
+    g.node.extend(new_nodes)
+    del g.initializer[:]
+    g.initializer.extend([t for t in new_inits if t.name not in rm])
+
+    location = os.path.basename(enc_file) + ".data"
+    onnx.save(model, enc_file, save_as_external_data=True,
+              all_tensors_to_one_file=True, location=location, size_threshold=1024)
+    print(f"  rewrite_pointwise_conv: {len(pw)} pointwise Conv -> "
+          f"Transpose+MatMul+Transpose (weight on input[1], quantizable)")
+
+
 class FireRedEncoderWrapper(nn.Module):
     """Conformer encoder + per-decoder-layer cross k/v projections."""
 
@@ -318,6 +399,17 @@ def main():
         **export_kw,
     )
     print("saved", enc_file)
+
+    # Always rewrite the encoder's 32 pointwise convs to MatMul. This is a
+    # prerequisite for int8, not an optional tweak: quantize-int8.py quantizes
+    # MatMul but deliberately NOT Conv (ConvInteger has no fast arm64 kernel),
+    # so as plain Conv these 32 layers would stay fp32 and become the int8
+    # encoder's bottleneck. As MatMul they lower to int8 MatMulInteger (sdot),
+    # measured ~30%% faster int8 encoder, recognition token-identical. Doing it
+    # here (pre-quantization) is the only way to reach that path — sherpa's
+    # optimize-encoder.py runs post-quantization, where the convs are already
+    # fp32 and the same rewrite is a no-op rename.
+    rewrite_pointwise_conv(enc_file)
 
     dec_file = os.path.join(args.output_dir, "decoder.onnx")
     torch.onnx.export(
