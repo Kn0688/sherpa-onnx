@@ -120,10 +120,13 @@ OfflineWhisperGreedySearchDecoder::Decode(Ort::Value cross_k,
 
   // Estimate the maximum number of tokens to generate so that we can
   // allocate a self-attention KV cache that is just large enough.
-  // Assuming at most 6 tokens per second, the decoder loop below runs at
+  // Assuming at most 8 tokens per second, the decoder loop below runs at
   // most num_possible_tokens steps, and each step advances the cache by 1.
   // The +4 margin covers the initial prompt tokens and rounding.
-  int32_t num_possible_tokens = num_feature_frames / 100.0 * 6;
+  // Note: the loop below is bounded by num_possible_tokens, so an
+  // underestimate silently truncates the transcription. 8 (not 6) tokens/s
+  // leaves headroom for fast speech.
+  int32_t num_possible_tokens = num_feature_frames / 100.0 * 8;
   num_possible_tokens =
       std::min<int32_t>(num_possible_tokens, model_->TextCtx() / 2);
   num_possible_tokens = std::max<int32_t>(num_possible_tokens, 0);
