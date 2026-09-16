@@ -41,11 +41,85 @@ python3 ./scripts/fire-red-asr/quantize-int4.py --dir ./out
 # -> ./out/decoder.int4.onnx  (recommended decoder; use encoder.int8.onnx)
 ```
 
+```bash
+python3 ./scripts/fire-red-asr/convert-fp16.py --dir ./out
+# -> ./out/{encoder,decoder}.fp16.onnx (+ .data)  (for CUDA GPUs; see below)
+```
+
 Note: exporting requires `onnxscript` (torch dynamo exporter) and writes
 external-data `.data` files (models > 2GB). Do NOT add `Conv` to
 `op_types_to_quantize` on arm64 — ConvInteger is slower than fp32 Conv there.
 
+## Which quantization for which platform
+
+| target platform | recommended | why |
+|---|---|---|
+| arm64 CPU / iOS / Android | **int8** (`quantize-int8.py`) + int4 decoder | sdot / KleidiAI ukernels; fp16 has no win on CPUs without fp16 GEMM |
+| x86 CPU (VNNI) | **int8** | same reason, sdot-equivalent (VNNI) |
+| NVIDIA CUDA with tensor-core int8 (RTX 20xx+, sm_75 with TCs) | int8 QDQ or fp16 — measure both | IMMA exists, so int8 GEMM is real |
+| **NVIDIA CUDA without tensor cores (GTX 16xx, Turing TU116)** | **fp16** (`convert-fp16.py`) | measured 2.7x over int8 — see below |
+
+### fp16 for CUDA GPUs without int8 tensor cores (`convert-fp16.py`) — measured 2.7x over int8
+
+**Root cause this fixes.** `quantize_dynamic` emits *separated* dynamic
+quantization: every quantized MatMul is wrapped in `DynamicQuantizeLinear` +
+`Cast` + `Mul` entourage nodes. On the CUDA EP only `MatMulInteger` itself has
+a GPU kernel; the entourage ops run on CPU, so ORT inserts a host<->device
+`Memcpy` pair around every quantized MatMul. Measured on GTX 1660 SUPER
+(driver 580, ORT 1.27 CUDA EP): **535 Memcpy nodes** inserted into the encoder
+graph, and the int8 encoder on CUDA is only **13% faster than CPU**
+(1055 ms vs 1213 ms at T=500) — the PCIe ping-pong eats the entire GPU win.
+The decoder is hit worse: the same entourage re-runs every autoregressive step.
+
+**What fp16 does.** fp16 weights + activations let MatMul / Conv / LayerNorm
+all stay fused on the GPU (no quantization entourage, no memcpys). TU116 has
+no int8 tensor cores but does run fp16 CUDA-core math at 2x fp32 rate, and
+halved weight bytes halve bandwidth pressure.
+
+**How the script works.**
+1. `onnxruntime.transformers.float16.convert_float_to_float16` with
+   `keep_io_types=True` — graph inputs/outputs stay fp32, so the C++ model
+   wrapper (`offline-fire-red-asr-model.cc`) needs no changes.
+2. `op_block_list` keeps numerically sensitive ops in fp32
+   (LayerNormalization, Softmax, Sigmoid, Exp, Pow, ReduceMean, ...) so fp16
+   rounding stays ~1e-3 instead of compounding through 16 layers.
+3. Works around three ORT converter artifacts on this graph (dangling
+   `graph_output_cast_N` boundary-cast inputs, duplicate tensor/node names —
+   one name reused 47x, dead bytes from repeated .data re-saves). See the
+   script docstring for details.
+
+**Measured** (GTX 1660 SUPER 6GB, CUDA EP, production asr-service, zh):
+
+| metric | int8 (separated) | fp16 | gain |
+|---|---|---|---|
+| encoder only, T=500 | 1055 ms | **396 ms** | **2.67x** |
+| 20s utterance e2e (batch 1) | 5446 ms | **2042 ms** | **2.67x** |
+| 160s production job RTF (64 segs) | 0.181 | **0.098** | **1.85x** |
+| recognition text | md5 `8bd84d39…` | **identical** (3 runs) | zero loss |
+| model size | 1.26 GB | 2.32 GB | +1.1 GB |
+| GPU memory (service, per-segment decode) | ~1010 MiB | 3308 MiB | +2.3 GB |
+
+The 160s-job number includes a second, measured finding: **with fp16, batching
+(`decode_streams`, MAX_BATCH >= 4) becomes a regression, not a win** — batch-8
+decode = 23.9 s vs 14.9 s per-segment. The batched decoder step costs ~95 ms
+vs ~7 ms per-segment because the batched path's self-KV cache / cross K/V
+tensors live in CPU memory and are re-uploaded every step (PCIe-bound). With
+int8 the slow encoder (~1 s/segment) made batching worth that tax; fp16 removes
+the encoder bottleneck and exposes it. So: **fp16 + per-segment decoding** is
+the fast configuration; re-enable batching only after the fork's batched
+decoder keeps its KV cache GPU-resident.
+
+**Caveats.**
+- GPU memory: fp16 is ~2.3 GB larger resident than int8 — fine on 6 GB, check
+  headroom on smaller cards.
+- Not bit-exact vs fp32 (fp16 rounding), but recognition text was
+  token-identical to the int8 production model on the full 160s benchmark
+  (3 runs, md5-equal). If you see drift on your data, widen
+  `OP_BLOCK_LIST` in the script.
+- Input must be the **fp32** pair from `export-onnx.py` (not the int8 one).
+
 ## Optimizations
+
 
 ### Encoder: pointwise conv -> MatMul at export time (default) — int8 ~30% faster, ~37% smaller, token-identical
 
