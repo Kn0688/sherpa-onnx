@@ -103,11 +103,16 @@ macOS 侧的结论"批量 1.2~1.5×"在 fp16 + CUDA 上**翻转**了。实测扫
 
 ## 6. CUDA 平台剩余路线图（按预期收益排序）
 
-1. **encoder 注意力/逐点算子融合（最大头）**：fp16 encoder 距理论 GEMM 上限约 25 倍 —— 瓶颈是 563 Mul / 230 Add 等 elementwise 算子与未融合的注意力（访存/launch bound），且 N 从 1→8 纯线性缩放、无批量效率。路径：导出层调整让注意力匹配 ORT 的 fused MHA pattern（或按 SDPA 形式导出），属 `export-onnx.py` 层面的改动，不动 ORT 源码。
-2. **fork C++ 批量路径 GPU-resident KV cache**：`GetInitialSelfKVCache` / `ForwardDecoder` 的分配器改 CUDA allocator，消除每步 PCIe 搬运。修好后批量收益可恢复（长任务吞吐再上一层）。属 fork 内改动，不涉及 ORT 源码。
-3. **ORT `enable_cuda_graph`**：decoder 每步形状固定，可捕获 CUDA Graph 消除 launch/dispatch 开销。provider option 层面即可开启，不算改 ORT 源码。
-4. **TensorRT EP**：安装 libnvinfer 后可用 TRT EP 试 encoder（静态形状分段或 profile 化）。
-5. **阶段 B（用户明确暂缓）**：改 onnxruntime 源码 —— 量化外围算子 GPU 化 / Memcpy 融合 / 显存池复用策略。只有在前四项穷尽后才有必要。
+profiling 实证（2026-09-16,encoder fp16 T=500 CUDA,ORT profiler）：单次前向 kernel 时间 ~208ms vs 墙钟 396ms（**~47% 消耗在 kernel 间隙/launch 开销**）;kernel 时间内 Cast **33.7%**、Conv 17.1%、MatMul 仅 **13.7%**、Add/LN/mask 类 ~28%。并用 `SetOptimizedModelFilePath` dump 优化后图确认：**encoder 0 个 com.microsoft 融合节点**（相对位置编码注意力不匹配 ORT MHA fusion pattern）,decoder 有 32 个（16 层 self/cross 注意力已融合）。
+
+1. **消除 Cast 税（kernel 内的最大单块，33.7%）**:fp16 转换护栏（LayerNorm/Sigmoid/Softmax 保 fp32）造成 1554 次/3runs 的 Cast 边界。路径：逐算子验证精度后放宽 `op_block_list`（如 LN 允许 fp16 累加 fp32 的 CUDA 内核），或在导出层把敏感算子改为 fp16 安全写法。属 `convert-fp16.py`/`export-onnx.py` 层面。
+2. **CUDA Graph 消除 launch 开销（墙钟的 ~47%）**:encoder/decoder 每步形状固定即可捕获；分段 T 变化可用分桶 padding 解决。ORT provider option `enable_cuda_graph` + fork C++ 侧 IOBinding，不改 ORT 源码。
+3. **encoder 注意力融合**:dump 证实当前 0 融合；导出层改造让注意力匹配 ORT fused MHA pattern（或按 SDPA 形式导出）。当前注意力相关 elementwise/Transpose 占比可观，但 Softmax 本身仅 0.4%，收益需实测验证，排在 Cast 和 CUDA Graph 之后。
+4. **fork C++ 批量路径 GPU-resident KV cache**:`GetInitialSelfKVCache` / `ForwardDecoder` 的分配器改 CUDA allocator，消除每步 PCIe 搬运，修好后批量收益可恢复（长任务吞吐再上一层）。fork 内改动。
+5. **TensorRT EP**：安装 libnvinfer 后可用 TRT EP 试 encoder（静态形状分段或 profile 化）。
+6. **阶段 B（用户明确暂缓）**：改 onnxruntime 源码 —— 量化外围算子 GPU 化 / Memcpy 融合 / 显存池复用策略。只有在前几项穷尽后才有必要。
+
+另发现（长程任务实测，3h48/3637 段）：ORT CUDA arena 对变化的分段 shape 只保留不释放，显存从 3305 MiB 长到 5354 MiB 稳定（6GB 卡内安全，更长任务需注意）——与 iOS 端 jetsam 观察到的 arena retention 同源；长音频 RTF 0.131 高于短音频 0.098，因切段变长后 encoder 注意力 O(T²) 超线性。
 
 ## 7. 复现指引
 
