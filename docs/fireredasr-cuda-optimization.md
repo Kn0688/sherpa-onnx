@@ -112,7 +112,7 @@ profiling 实证（2026-09-16,encoder fp16 T=500 CUDA,ORT profiler）：单次�
 5. **TensorRT EP**：安装 libnvinfer 后可用 TRT EP 试 encoder（静态形状分段或 profile 化）。
 6. **阶段 B（用户明确暂缓）**：改 onnxruntime 源码 —— 量化外围算子 GPU 化 / Memcpy 融合 / 显存池复用策略。只有在前几项穷尽后才有必要。
 
-另发现（长程任务实测，3h48/3637 段）：ORT CUDA arena 对变化的分段 shape 只保留不释放，显存从 3305 MiB 长到 5354 MiB 稳定（6GB 卡内安全，更长任务需注意）——与 iOS 端 jetsam 观察到的 arena retention 同源；长音频 RTF 0.131 高于短音频 0.098，因切段变长后 encoder 注意力 O(T²) 超线性。
+另发现（长程任务实测，3h48/3637 段）：ORT CUDA arena 对变化的分段 shape 只保留不释放，显存从 3305 MiB 长到 5354 MiB 稳定（6GB 卡内安全，更长任务需注意）——与 iOS 端 jetsam 观察到的 arena retention 同源；长音频 RTF 0.131 高于短音频 0.098，原因是语音占比更高（83% vs 69%）+ 分段长尾（均值 3.1s vs 1.7s，p99 14s）下 decoder 成本呈 a·d+b·d² 超线性（二次项来自每步 cross-attention 随段长增长 × 步数随段长正比；encoder 实测近似线性 ~79ms/秒音频，T=250~2000）。
 
 ## 7. 复现指引
 
