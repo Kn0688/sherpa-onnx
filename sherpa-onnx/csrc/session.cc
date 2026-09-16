@@ -5,6 +5,7 @@
 #include "sherpa-onnx/csrc/session.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -327,6 +328,20 @@ Ort::SessionOptions GetSessionOptionsImpl(
           // Default OrtCudnnConvAlgoSearchExhaustive is extremely slow
           options.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
           // set more options on need
+        }
+        // Env overrides for CUDA arena control (unset = ORT defaults):
+        //   SHERPA_ONNX_CUDA_GPU_MEM_LIMIT — bytes; caps the BFC arena.
+        //     Overflow allocations fall back to transient cudaMalloc instead of
+        //     unbounded arena retention (arena caches freed blocks forever,
+        //     which grows VRAM without bound on varied input shapes).
+        //   SHERPA_ONNX_CUDA_ARENA_EXTEND_STRATEGY — 0 = kNextPowerOfTwo
+        //     (ORT default), 1 = kSameAsRequested (less aggressive extension).
+        if (const char *s = std::getenv("SHERPA_ONNX_CUDA_GPU_MEM_LIMIT")) {
+          options.gpu_mem_limit = std::strtoull(s, nullptr, 10);
+        }
+        if (const char *s =
+                std::getenv("SHERPA_ONNX_CUDA_ARENA_EXTEND_STRATEGY")) {
+          options.arena_extend_strategy = std::atoi(s) == 1 ? 1 : 0;
         }
         sess_opts.AppendExecutionProvider_CUDA(options);
       } else {
