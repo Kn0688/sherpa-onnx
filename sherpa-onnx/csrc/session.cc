@@ -329,15 +329,20 @@ Ort::SessionOptions GetSessionOptionsImpl(
           options.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
           // set more options on need
         }
-        // Env overrides for CUDA arena control (unset = ORT defaults):
-        //   SHERPA_ONNX_CUDA_GPU_MEM_LIMIT — bytes; caps the BFC arena.
-        //     Overflow allocations fall back to transient cudaMalloc instead of
-        //     unbounded arena retention (arena caches freed blocks forever,
-        //     which grows VRAM without bound on varied input shapes).
+        // Env overrides for CUDA arena control (unset = ORT defaults).
+        // Measured on ORT 1.27 + GTX 1660 SUPER: gpu_mem_limit is PER-SESSION
+        // (each OrtSession gets its own BFCArena, so encoder+decoder sessions
+        // each have their own cap) and exceeding it HARD-FAILS the Run — there
+        // is no cudaMalloc fallback in this ORT version. Use only with a value
+        // safely above the largest single-run footprint.
+        //   SHERPA_ONNX_CUDA_GPU_MEM_LIMIT — bytes; 0/negative = ignored.
         //   SHERPA_ONNX_CUDA_ARENA_EXTEND_STRATEGY — 0 = kNextPowerOfTwo
         //     (ORT default), 1 = kSameAsRequested (less aggressive extension).
         if (const char *s = std::getenv("SHERPA_ONNX_CUDA_GPU_MEM_LIMIT")) {
-          options.gpu_mem_limit = std::strtoull(s, nullptr, 10);
+          size_t limit = std::strtoull(s, nullptr, 10);
+          if (limit > 0) {
+            options.gpu_mem_limit = limit;
+          }
         }
         if (const char *s =
                 std::getenv("SHERPA_ONNX_CUDA_ARENA_EXTEND_STRATEGY")) {
