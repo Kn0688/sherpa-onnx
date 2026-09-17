@@ -18,7 +18,7 @@
 - 对照参照系：iOS MLX 4h 长音频 RTF ≈ 0.125 —— **服务端首次反超手机端**
 - 精度：160s / 800 字文本 md5 三轮全同（`8bd84d39…`），与 int8 逐字一致，零损失
 - 显存峰值：逐句 3306 MiB / 批量 8 为 4322 MiB（6GB 卡内安全）
-- **2026-09-17 起 fork 首次修改 sherpa-onnx C++ 代码**：decoder CUDA Graph（opt-in，`SHERPA_ONNX_CUDA_GRAPH=1`）。墙钟持平（生产 decoder 早已是 IOBinding + KV cache GPU-resident 的 6.1ms/步，探针 3.0× 是相对非驻留路径），收益是 **CPU 发射次数 991→1 次/步（-99.9%）**。之前的 fp16/MAX_BATCH 优化均为模型侧/配置侧，不动 C++
+- **2026-09-17 decoder CUDA Graph 实验：已实现、验证、移除**。墙钟零收益（生产 decoder 早已 GPU-resident 6.1ms/步）,3h48 长任务反而 +4.6%，双路径复杂度不抵收益，代码已移除（见死路清单）。fp16/MAX_BATCH 优化均为模型侧/配置侧，fork C++ 保持无功能性改动
 
 ## 1. 平台与环境
 
@@ -101,6 +101,7 @@ macOS 侧的结论"批量 1.2~1.5×"在 fp16 + CUDA 上**翻转**了。实测扫
 - **VAD（silero v5）优化**：三条路径全部证伪。生产模型是 silero **v5**（非 v4）；官方 sequence 版与生产非等效（160s 中文 max prob diff 0.75，段数 127 vs 113）；非 512 chunk 喂入改变切分（64→23 段）。零数值损耗约束下无可做空间，收益上限本来就只有 ~0.6s/job
 - **TensorRT EP**：fork ORT 构建列出了 TRT EP，但系统无 libnvinfer，实际不可用；要用需先装 TensorRT
 - **`gpu_mem_limit` 封顶显存（两轮实测均不成立，代码已回滚）**：曾在 fork `session.cc` 加 `SHERPA_ONNX_CUDA_GPU_MEM_LIMIT` / `SHERPA_ONNX_CUDA_ARENA_EXTEND_STRATEGY` 环境变量开关做封顶实验（验证完已 revert 删除）。实测：① 4GiB 无效——**BFCArena 按 OrtSession 独立**，encoder/decoder 各一个 arena，总量照样涨到 5337 MiB;② 2GiB/session 直接任务失败——**这版 ORT 1.27 超限没有 cudaMalloc 回退，Run 硬失败**(BFCArena "Available memory of 0")。且 arena 需求随段长变化，硬上限等于把显存增长换成随机挂任务。要封总量的正路是让 encoder/decoder session 共享同一个 CUDA allocator(ORT 支持 `CreateAllocator`+`RegisterAllocator`)，一个 arena 一个上限
+- **decoder CUDA Graph（2026-09-17 完整落地验证后移除）**：在 fork `offline-fire-red-asr-model.cc` 实现了 decoder 自回归步的 CUDA Graph 捕获/回放（按桶后形状缓存 graph、固定 device buffer、D2D 回喂 self KV、MAX_CONTEXTS 上限 + 回退），数值验证完全正确（160s md5 `8bd84d39…` ×3;cn_2min 图开/关/回退触发三模式 md5 一致；3h48 74490 字、显存 5375 MiB 平台期不 OOM)。**但墙钟零收益**——生产 decoder 早已是 IOBinding + KV cache GPU-resident 的 6.1ms/步（GPU kernel-work 下限），graph replay 6.06ms/步；探针报告的 3.0× 对照组是非驻留路径，生产不存在那份税。唯一收益是 CPU 发射 991→1 次/步，单 worker 场景用不上；3h48 长任务反而 1799s vs 基线 1720s(+4.6%，每步 D2D 回喂拷贝的开销）。复杂度（双路径 + 下述 ORT 坑）不抵收益，代码已移除，如需复活见 git 历史 `9ae5c52a`+`af3abb12`。**ORT 1.27 关键坑（留给未来）**:graph 会话上不带 `gpu_graph_id` 的 Run 默认 annotation id=0,ORT 跑够 `min_num_runs_before_cuda_graph_capture` 次后会**静默为 id 0 捕获图**（绑定当次 Run 的临时 buffer)，后续 replay 输出不刷新 → `OrtValue Get<Tensor> on null` 崩溃；不参与 graph 的 Run 必须显式 `gpu_graph_id=-1`(`kCudaGraphAnnotationSkip`)
 
 ## 6. CUDA 平台剩余路线图（按预期收益排序）
 
@@ -109,15 +110,10 @@ profiling 实证（2026-09-16,encoder fp16 T=500 CUDA,ORT profiler）：单次�
 **2026-09-17 探针修正（bench 实测，全在 fork ORT 1.27 CUDA EP）**:
 - **Cast 税是假象**：放宽护栏后 encoder 静态 Cast 871→199(-77%)，墙钟几乎不动（T=500: 396→394ms;T=2000: 1657→1639ms)。profiler 里的 Cast 耗时占比不等于墙钟影响。**此方向放弃**(fp16sl/fp16slx 变体在 `~/firered-work/export_clean/`，未采纳）
 - **encoder 是 kernel-work bound**:N=1→8 耗时近似线性（397/747/1504/2903ms);CUDA Graph 无效果（T=500: 393 vs 396ms;T=2000: 1646 vs 1657ms)
-- **decoder 是 launch bound,CUDA Graph 大胜（探针语境）**：固定形状（N=1, cache_len=150, cross T=500）IOBinding + `enable_cuda_graph=1` 实测 **23.32 → 7.66 ms/步（3.0×）**。注意对照组是非 GPU-resident 路径；生产早已 GPU-resident（6.1ms/步），落地后墙钟持平、CPU 发射 -99.9%——见下方路线图第 2 项"已落地"
+- **decoder 是 launch bound,CUDA Graph 大胜（探针语境）**：固定形状（N=1, cache_len=150, cross T=500）IOBinding + `enable_cuda_graph=1` 实测 **23.32 → 7.66 ms/步（3.0×）**。注意对照组是非 GPU-resident 路径；生产早已 GPU-resident（6.1ms/步）。完整落地验证后墙钟零收益，代码已移除——见死路清单
 
 1. **消除 Cast 税（已被 2026-09-17 探针证伪）**：见上方修正——Cast 减少 77% 墙钟不动，profiler kernel 占比误导。勿再投入。
-2. **CUDA Graph 用于 decoder（已落地启用，2026-09-17）**：fork `offline-fire-red-asr-model.cc` 实现，opt-in（编译 `SHERPA_ONNX_ENABLE_GPU=ON` + provider=cuda + 运行时 `SHERPA_ONNX_CUDA_GRAPH=1`，其余构建/平台零影响）。实测结论修正：**生产 decoder 早已是 IOBinding + KV cache GPU-resident（6.1ms/步，GPU kernel-work 下限），graph replay 6.06ms/步，墙钟持平**；探针的 23.32→7.66ms 是相对非驻留路径，那个税在生产不存在。真实收益是 **CPU 侧 kernel 发射 991→1 次/步（-99.9%）**， decode 阶段 83% 是 encoder，端到端 RTF 不变（160s 0.0970-0.0980，文本 md5 与基线逐字一致；VRAM 中性）。实现要点：
-   - graph 按 run option `gpu_graph_id` 缓存（ORT replay 不校验形状/地址、跳过输入拷贝）；logits 绑 device buffer 后手动 D2H；self KV 输出绑固定 buffer + 每步 D2D 回喂（段中零拷贝，指针比较识别段首）
-   - 形状分桶复用：cache_len 向上取整 32、cross_t 取整 64（`SHERPA_ONNX_CUDA_GRAPH_CACHE_BUCKET`/`CROSS_BUCKET` 可调），padding 位被 mask 精确屏蔽，数值不变
-   - **安全上限 `SHERPA_ONNX_CUDA_GRAPH_MAX_CONTEXTS`**（生产设 4）：每个 context 永久钉住固定 buffer + 一张捕获图，不设上限长音频多形状会在 6GB 卡上 OOM（实测第 11 个 context cudaGraphInstantiate 失败于 5725/6144 MiB）；超出预算的形状回退普通 IOBinding 路径，数值一致
-   - **关键坑（ORT 1.27 行为）**：graph 会话上不带 `gpu_graph_id` 的 Run 默认 annotation id=0，跑够 `min_num_runs_before_cuda_graph_capture` 次后 ORT 会**静默为 id 0 捕获图**（绑定的是回退路径的临时 buffer），后续 replay 输出不刷新 → `OrtValue Get<Tensor> on null` 崩溃（且捕获图引用已释放内存）。回退路径必须显式 `gpu_graph_id=-1`（`kCudaGraphAnnotationSkip`）退出捕获/回放——已在 fork 中修复并验证（回退触发时文本 md5 与基线一致）
-   - 不需要 CUDA 头文件：cudart ABI 本地声明，`find_library` 链接 libcudart
+2. **CUDA Graph 用于 decoder（已落地验证并移除，2026-09-17）**：实现、数值验证（三种模式 md5 逐字一致）、长任务验证（3h48 不 OOM）全部完成，但墙钟零收益（生产 decoder 已 GPU-resident 6.1ms/步）且长任务 +4.6%，代码已移除。完整过程与 ORT 隐式捕获坑见死路清单末条。
 3. **encoder 注意力融合**:dump 证实当前 0 融合；但生产分段短（均值 T≈311),T² 分数矩阵很小，MHA 融合对生产形状收益有限，优先级下调。encoder 现为 kernel-work bound，进一步收益需减少 elementwise kernel 数量（导出层融合 LN+Mul+Add 链等）。
 4. **fork C++ 批量路径 GPU-resident KV cache**:`GetInitialSelfKVCache` / `ForwardDecoder` 的分配器改 CUDA allocator，消除每步 PCIe 搬运，修好后批量收益可恢复（长任务吞吐再上一层）。fork 内改动。
 5. **TensorRT EP**：安装 libnvinfer 后可用 TRT EP 试 encoder（静态形状分段或 profile 化）。
