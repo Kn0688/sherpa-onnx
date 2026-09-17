@@ -2,7 +2,7 @@
 
 > 日期：2026-09 · 平台：Linux x86_64 + NVIDIA GTX 1660 SUPER 6GB（TU116，**无 tensor core**）· 代码：fork 分支 `fireredasr-batch-decoding`（`ae0063f3`）
 >
-> 本文是 CUDA 平台的专项记录，与 `docs/fireredasr-optimization.md`（macOS arm64 / iOS 视角）互补：那边讲模型结构与 C++ 解码优化，这边讲**把同一份模型跑上 CUDA 时的量化格式适配问题**、已落地的两项优化，以及剩余路线图。所有数字均为实测值。
+> 本文是 CUDA 平台的专项记录，与 `docs/fireredasr-optimization.md`（macOS arm64 / iOS 视角）互补：那边讲模型结构与 C++ 解码优化，这边讲**把同一份模型跑上 CUDA 时的量化格式适配问题**、已落地的三项优化，以及剩余路线图。所有数字均为实测值。
 
 ## 0. 头条结果（TL;DR）
 
@@ -12,21 +12,24 @@
 |---|---|---|
 | 官方发布 int8，逐句 | 0.318 | 基线 |
 | fork int8 + 批量 8 | 0.181 | macOS 侧批量优化移植 |
-| fork **fp16** + 批量 8 | 0.154 | 优化一 |
-| fork **fp16 + 逐句（MAX_BATCH=0）** | **0.098** | 优化二，累计 **3.2×** |
+| fork fp16 + 批量 8 | 0.154 | 优化一 |
+| fork fp16 + 逐句（MAX_BATCH=0） | 0.098 | 优化二，累计 3.2× |
+| fork **fp32 encoder + fp16 decoder + 逐句** | **0.036** | 优化三（零代码，只换模型文件），累计 **8.8×** |
 
-- 对照参照系：iOS MLX 4h 长音频 RTF ≈ 0.125 —— **服务端首次反超手机端**
-- 精度：160s / 800 字文本 md5 三轮全同（`8bd84d39…`），与 int8 逐字一致，零损失
-- 显存峰值：逐句 3306 MiB / 批量 8 为 4322 MiB（6GB 卡内安全）
-- **2026-09-17 decoder CUDA Graph 实验：已实现、验证、移除**。墙钟零收益（生产 decoder 早已 GPU-resident 6.1ms/步）,3h48 长任务反而 +4.6%，双路径复杂度不抵收益，代码已移除（见死路清单）。fp16/MAX_BATCH 优化均为模型侧/配置侧，fork C++ 保持无功能性改动
+- 对照参照系：iOS MLX 4h 长音频 RTF ≈ 0.125 —— 服务端反超手机端后进一步拉开到 ~3.5×
+- 精度：160s / 800 字文本 md5 三轮全同（`8bd84d39…`），fp32 与 fp16/int8 链路**逐字节一致**，零损失
+- 显存峰值：fp32 链路 5337 / 6144 MiB（160s job，逐句）
+- **2026-09-17 decoder CUDA Graph 实验：已实现、验证、移除**。墙钟零收益（生产 decoder 早已 GPU-resident 6.1ms/步），3h48 长任务反而 +4.6%，双路径复杂度不抵收益，代码已移除（见死路清单）。fork C++ 保持无功能性改动
+- **2026-09-17 重要更正**：此前"encoder 47% 墙钟消耗在 kernel 间隙"的结论是**测量错误**（ORT profiler 口径问题，见 §6）。真实根因是 fp16 GEMM 在无 tensor core 的 TU116 上比 fp32 慢 ~6×，直接催生了优化三
 
 ## 1. 平台与环境
 
 - GPU：GTX 1660 SUPER 6GB，**TU116 架构无 tensor core**（RTX 20xx 起才有）。旧文档中"GTX 1660 有 INT8 tensor core (IMMA)"的说法是错的，已更正：int8 GEMM 在这张卡上没有硬件加速红利，这直接决定了量化路线的选择
 - ORT：fork 构建的 onnxruntime 1.27 CUDA EP（`build-gpu/_deps/onnxruntime-src`）；TensorRT EP 在构建里列出但系统无 libnvinfer，实际不可用
-- 服务：`/home/kn/asr-service`（GTX 1660 机器，driver 580.126.09），zh 链路 = silero VAD → FireRedASR fp16 → 标点
+- 服务：`/home/kn/asr-service`（GTX 1660 机器，driver 580.126.09），zh 链路 = silero VAD → FireRedASR（encoder fp32 + decoder fp16，见 §5）→ 标点
 - 测量工具（均在远程机 `~/firered-work/`）：
   - `bench/bench_fp16`、`bench/bench_enc2`、`bench/bench_dec` —— 直连 fork ORT CUDA lib 的自建 C++ 基准二进制（g++ 链接 `build-gpu/_deps/onnxruntime-src/lib`），用于隔离单模型/单阶段计时
+  - `cublas_probe/bench_cublas` —— cublas/cublasLt GEMM 微基准（fp16/fp32/algo 遍历）
   - `run_ab.py` —— jobs 接口 3 轮 A/B：RTF 中位 + 文本 md5 + `nvidia-smi` 显存峰值
   - 服务端 `server.py` 已加 stage/batch 计时日志（保留在生产），可直接看 encoder/decoder/每步耗时拆分
 
@@ -42,9 +45,9 @@
 
 这也解释了为什么 macOS/iOS 上 int8 是正确答案（CPU EP 上 MatMulInteger 走 sdot/IMMA 类内核，全图无跨设备拷贝），而同一份 int8 模型上 CUDA 就是错误答案。
 
-## 3. 优化一：fp16 转换（encoder 2.67×，文本逐字一致）
+## 3. 优化一：fp16 转换（相对 int8 2.67×，文本逐字一致）
 
-**思路（路线 A，不改 onnxruntime 源码）**：既然 int8 的外围算子掉 CPU，就换成 CUDA EP 原生全图支持的格式 —— fp16。TU116 无 tensor core，但 fp16 CUDA core 吞吐仍是 fp32 的 ~2×，且图里不再有任何量化外围算子，零 memcpy。
+**思路（路线 A，不改 onnxruntime 源码）**：既然 int8 的外围算子掉 CPU，就换成 CUDA EP 原生全图支持的格式 —— fp16。图里不再有任何量化外围算子，零 memcpy。
 
 **流水线**：
 
@@ -77,6 +80,8 @@ e2e 收益（−15%）小于单段收益（2.67×）的原因：批量解码已�
 
 **回滚**：生产保留 `server.py.bak_int8` 与 `models/zh/*.int8.onnx`，`_build_recognizer` 的 zh 分支改回 int8 文件名即可。
 
+> **2026-09-17 更正**：本节原文假设"fp16 CUDA core 吞吐仍是 fp32 的 ~2×"——**对 GEMM 不成立**。cublas 在 TU116（无 tensor core）上 fp16 GEMM 实测仅 ~0.5 TFLOPS，而 fp32 SGEMM 有 3-4.5 TFLOPS，fp16 encoder 比 fp32 慢 ~6×（见 §5）。fp16 当时的 2.67× 是相对烂到底的 int8（535 memcpy）而言的；相对 fp32，fp16 是负优化。encoder 已换 fp32；decoder 因生产逐句 N=1 形态是带宽 bound（fp16 权重字节减半占优）维持 fp16。
+
 ## 4. 优化二：MAX_BATCH=0 —— fp16 之后批量从收益变拖累
 
 macOS 侧的结论"批量 1.2~1.5×"在 fp16 + CUDA 上**翻转**了。实测扫描（160s / 64 段）：
@@ -95,34 +100,76 @@ macOS 侧的结论"批量 1.2~1.5×"在 fp16 + CUDA 上**翻转**了。实测扫
 
 **教训**：批量是不是优化，取决于"摊薄的收益"与"批量的每步税"的相对大小 —— 任何一层变快后都要重新测量，不能沿用旧结论。
 
-## 5. 死路清单（已证伪，勿重复尝试）
+## 5. 优化三：encoder 换 fp32（2026-09-17，RTF 0.098 → 0.036，2.72×，零代码）
+
+**起源**：追查"encoder kernel ~208ms vs 墙钟 396ms，47% 间隙"的过程中，nsys 实测证明**间隙不存在**——ORT 1.27 profiler 的 `*_kernel_time` 事件是 CPU 侧时间戳包住 `OpKernel::Compute()`（async launch），不是 GPU kernel 时长（v1.27.0 `sequential_executor.cc` KernelScope 源码确认）。nsys ground truth（encoder fp16 T=500，6 次 run）：9826 个 kernel，GPU **97.8% 时间忙碌**，每 run kernel busy ≈ 391ms ≈ 墙钟 397ms；GEMM 占 96.7%，Cast 全部仅 ~3.4ms/run，H2D/DtoH 拷贝合计 <1%。`CUDA_LAUNCH_BLOCKING=1` 对照实验（node dur 总和 408.7ms，其中 MatMul 386.5ms）交叉印证。这同时解释了此前两个"无效"：CUDA Graph 无效是因为**没有 launch 间隙可消**；Cast 削减 -77% 墙钟不动是因为 Cast kernel 本来就只占 ~1%。
+
+**真正的慢因**：cublas fp16 GEMM 在 TU116 上只有 ~0.5 TFLOPS，fp32 SGEMM 有 3-4.5 TFLOPS。cublas 微基准（`~/firered-work/cublas_probe/bench_cublas`，M=125 K=1280 N=5120，50 次均值）：
+
+| 路径 | 耗时 |
+|---|---|
+| fp32 SGEMM | **0.46 ms** |
+| fp16 compute32 | 3.83 ms |
+| fp16 compute16 | 2.95 ms |
+| cublasLt 遍历全部候选 algo 最优 | 3.14 ms |
+
+tensor-op math 无效（无 tensor core），ORT TunableOp 无效（396/397/397ms）——硬件+库层面死局，ORT 层面无解。fp16 T 扫描还有平台期（T=300≈381ms ≈ T=500≈400ms）：这些 GEMM 是 skinny-M（M=75~125），kernel 时间由 N×K 决定、几乎与 M 无关，fp16 在短段上浪费更狠。
+
+**T 扫描对比（ms，3 次中位数）**：
+
+| T | 100 | 300 | 500 | 700 | 1000 | 1400 |
+|---|---|---|---|---|---|---|
+| fp16 | 163 | 381 | 400 | 634 | 796 | 1230 |
+| fp32 | 20 | 56 | **66** | 106 | 147 | 207 |
+
+**处置（零代码，只换模型文件）**：
+
+- 干净重导出 fp32 encoder：onnx API load + save（单外部数据文件），产物 `~/firered-work/export_clean/encoder.fp32.onnx` + `.data` = **3,103,167,616 字节 ≈ 3.10GB**（与 775.8M params × 4B 精确吻合；原 `out/encoder.onnx.data` 6.2GB 确系重复 append 的坏文件）。转换器坑 #3 的又一次印证：外部数据文件多次 save 会留死字节，导出后必须核对文件大小 ≈ 参数量 × 字节数
+- 数值验证：与生产 fp16 encoder 输出 cosine = **1.000000 / 0.999999 / 1.000000**（cross_k/cross_v/mask，T=300）；输出 dtype（fp32）与 decoder.fp16 输入完全匹配
+- 部署：`/home/kn/asr-service/models/zh/encoder.fp32.onnx`(+`.data`)，`server.py:127` 一行改指向（备份 `server.py.bak_fp32enc`；fp16 文件保留可回滚）
+
+**实测（160s 生产 job，run_ab ×3）**：
+
+| 指标 | fp16 encoder | fp32 encoder |
+|---|---|---|
+| RTF（3 次） | 0.0980 / 0.0980 / 0.0970 | **0.0360 / 0.0360 / 0.0360** |
+| 处理耗时 | 15.6-15.8s | **5.791s（2.72×）** |
+| 文本 md5 | `8bd84d39…` | `8bd84d39…`（**逐字节相同**，800 字零差异） |
+| 显存峰值 | ~3300 MiB | 5337 / 6144 MiB |
+
+冒烟：cn_2min（120s，lang=zh）RTF 0.052，文本连贯正常。
+
+**decoder 维持 fp16（实测后主动决策）**：生产是逐句解码（N=1），此形态 decoder 每步是带宽 bound（385M 参数权重读取），fp16 权重字节减半反而占优——N=1, S=100, Tc=500 实测 fp16 **21.0** vs fp32 22.7 ms/step（fp32 慢 8%）。只有批量形态 fp32 才占优（N=8, S=150：fp16 223 vs fp32 **151** ms/step，1.47×）。将来 GPU-resident KV cache 落地、批量解码重启后需重新评估（届时精度选择可能再次翻转）。
+
+**教训**：
+
+1. **选精度前先用 cublas 微基准测硬件实际 GEMM 吞吐**，不要按"fp16 有 2× CUDA core 吞吐"的纸面规格推断——无 tensor core 的卡上 cublas fp16 GEMM 走非 tensor-op 路径，实测只有 ~0.5 TFLOPS。有 tensor core 的卡（RTX 20xx+）结论会反过来
+2. **ORT profiler 的 kernel_time 是 CPU 侧 launch 视角**，判断 GPU 间隙必须上 nsys/CUPTI；"profiler 里某类节点占比高"不等于"它是墙钟瓶颈"（Cast 税假象与此同源）
+3. int8 → fp16 → fp32 三连换的完整弧线：每换一次基线，上一轮的"正确答案"都可能被推翻
+
+## 6. 死路清单（已证伪，勿重复尝试）
 
 - **TU116 上指望 int8 硬件加速**：无 tensor core，int8 GEMM 不占便宜；且分离式 int8 在 CUDA EP 必掉 CPU（535 memcpy），打平 CPU（1055 vs 1213ms）
+- **TU116 上抢救 fp16 GEMM（2026-09-17 全部证伪）**：tensor-op math 无效（无 tensor core）、cublasLt 全 algo 遍历最优 3.14ms（fp32 0.46ms）、ORT TunableOp 无效（396/397/397ms）、自研 fp16 SIMT GEMM 相对 fp32 无优势。正解就是 fp32
 - **VAD（silero v5）优化**：三条路径全部证伪。生产模型是 silero **v5**（非 v4）；官方 sequence 版与生产非等效（160s 中文 max prob diff 0.75，段数 127 vs 113）；非 512 chunk 喂入改变切分（64→23 段）。零数值损耗约束下无可做空间，收益上限本来就只有 ~0.6s/job
-- **TensorRT EP**：fork ORT 构建列出了 TRT EP，但系统无 libnvinfer，实际不可用；要用需先装 TensorRT
+- **TensorRT EP**：fork ORT 构建列出了 TRT EP，但系统无 libnvinfer；且 TU116 无 tensor core，TRT fp16 不会比 fp32 快，此卡上放弃
 - **`gpu_mem_limit` 封顶显存（两轮实测均不成立，代码已回滚）**：曾在 fork `session.cc` 加 `SHERPA_ONNX_CUDA_GPU_MEM_LIMIT` / `SHERPA_ONNX_CUDA_ARENA_EXTEND_STRATEGY` 环境变量开关做封顶实验（验证完已 revert 删除）。实测：① 4GiB 无效——**BFCArena 按 OrtSession 独立**，encoder/decoder 各一个 arena，总量照样涨到 5337 MiB;② 2GiB/session 直接任务失败——**这版 ORT 1.27 超限没有 cudaMalloc 回退，Run 硬失败**(BFCArena "Available memory of 0")。且 arena 需求随段长变化，硬上限等于把显存增长换成随机挂任务。要封总量的正路是让 encoder/decoder session 共享同一个 CUDA allocator(ORT 支持 `CreateAllocator`+`RegisterAllocator`)，一个 arena 一个上限
 - **decoder CUDA Graph（2026-09-17 完整落地验证后移除）**：在 fork `offline-fire-red-asr-model.cc` 实现了 decoder 自回归步的 CUDA Graph 捕获/回放（按桶后形状缓存 graph、固定 device buffer、D2D 回喂 self KV、MAX_CONTEXTS 上限 + 回退），数值验证完全正确（160s md5 `8bd84d39…` ×3;cn_2min 图开/关/回退触发三模式 md5 一致；3h48 74490 字、显存 5375 MiB 平台期不 OOM)。**但墙钟零收益**——生产 decoder 早已是 IOBinding + KV cache GPU-resident 的 6.1ms/步（GPU kernel-work 下限），graph replay 6.06ms/步；探针报告的 3.0× 对照组是非驻留路径，生产不存在那份税。唯一收益是 CPU 发射 991→1 次/步，单 worker 场景用不上；3h48 长任务反而 1799s vs 基线 1720s(+4.6%，每步 D2D 回喂拷贝的开销）。复杂度（双路径 + 下述 ORT 坑）不抵收益，代码已移除，如需复活见 git 历史 `9ae5c52a`+`af3abb12`。**ORT 1.27 关键坑（留给未来）**:graph 会话上不带 `gpu_graph_id` 的 Run 默认 annotation id=0,ORT 跑够 `min_num_runs_before_cuda_graph_capture` 次后会**静默为 id 0 捕获图**（绑定当次 Run 的临时 buffer)，后续 replay 输出不刷新 → `OrtValue Get<Tensor> on null` 崩溃；不参与 graph 的 Run 必须显式 `gpu_graph_id=-1`(`kCudaGraphAnnotationSkip`)
 
-## 6. CUDA 平台剩余路线图（按预期收益排序）
+## 7. 现状与剩余路线图（fp32 落地后重排，2026-09-17）
 
-profiling 实证（2026-09-16,encoder fp16 T=500 CUDA,ORT profiler）：单次前向 kernel 时间 ~208ms vs 墙钟 396ms（**~47% 消耗在 kernel 间隙/launch 开销**）;kernel 时间内 Cast **33.7%**、Conv 17.1%、MatMul 仅 **13.7%**、Add/LN/mask 类 ~28%。并用 `SetOptimizedModelFilePath` dump 优化后图确认：**encoder 0 个 com.microsoft 融合节点**（相对位置编码注意力不匹配 ORT MHA fusion pattern）,decoder 有 32 个（16 层 self/cross 注意力已融合）。
+fp32 encoder 落地后 160s decode 从 ~15s 降到 5.79s，encoder 占比大幅下降，decoder（fp16，逐句 6.1ms/步）成为相对大头。剩余方向按现状排序：
 
-**2026-09-17 探针修正（bench 实测，全在 fork ORT 1.27 CUDA EP）**:
-- **Cast 税是假象**：放宽护栏后 encoder 静态 Cast 871→199(-77%)，墙钟几乎不动（T=500: 396→394ms;T=2000: 1657→1639ms)。profiler 里的 Cast 耗时占比不等于墙钟影响。**此方向放弃**(fp16sl/fp16slx 变体在 `~/firered-work/export_clean/`，未采纳）
-- **encoder 是 kernel-work bound**:N=1→8 耗时近似线性（397/747/1504/2903ms);CUDA Graph 无效果（T=500: 393 vs 396ms;T=2000: 1646 vs 1657ms)
-- **decoder 是 launch bound,CUDA Graph 大胜（探针语境）**：固定形状（N=1, cache_len=150, cross T=500）IOBinding + `enable_cuda_graph=1` 实测 **23.32 → 7.66 ms/步（3.0×）**。注意对照组是非 GPU-resident 路径；生产早已 GPU-resident（6.1ms/步）。完整落地验证后墙钟零收益，代码已移除——见死路清单
+1. **fork C++ 批量路径 GPU-resident KV cache**：`GetInitialSelfKVCache` / `ForwardDecoder` 的分配器改 CUDA allocator，消除每步 PCIe 搬运。修好后批量收益可恢复，且批量形态下 decoder fp32 反而更快（1.47×，见 §5），精度选择需届时重测。这是目前唯一明确的结构性收益
+2. **decoder 逐句形态进一步压缩**：N=1 带宽 bound 下，减少每步权重读取是唯一方向（权重 int8 量化只省带宽不要 int8 GEMM——TU116 上 int8 无硬件加速但字节数减半，待测；注意与 §2 分离式 int8 的 memcpy 坑区分，这里指 weight-only QDQ 类方案）
+3. **encoder 侧**：fp32 后 T=500 仅 66ms，绝对空间已小；0 个 com.microsoft 融合节点（相对位置编码注意力不匹配 ORT MHA fusion pattern）的问题仍在，但生产均值段 T≈311 下收益有限，优先级低
+4. **阶段 B（ORT 源码级）**：最大杠杆（fp16 GEMM 死局）已被 fp32 绕过，剩余可选：量化外围算子 GPU 化（仅当 decoder 走 int8 权重路径时相关）、allocator 共享（若要做显存封顶）
 
-1. **消除 Cast 税（已被 2026-09-17 探针证伪）**：见上方修正——Cast 减少 77% 墙钟不动，profiler kernel 占比误导。勿再投入。
-2. **CUDA Graph 用于 decoder（已落地验证并移除，2026-09-17）**：实现、数值验证（三种模式 md5 逐字一致）、长任务验证（3h48 不 OOM）全部完成，但墙钟零收益（生产 decoder 已 GPU-resident 6.1ms/步）且长任务 +4.6%，代码已移除。完整过程与 ORT 隐式捕获坑见死路清单末条。
-3. **encoder 注意力融合**:dump 证实当前 0 融合；但生产分段短（均值 T≈311),T² 分数矩阵很小，MHA 融合对生产形状收益有限，优先级下调。encoder 现为 kernel-work bound，进一步收益需减少 elementwise kernel 数量（导出层融合 LN+Mul+Add 链等）。
-4. **fork C++ 批量路径 GPU-resident KV cache**:`GetInitialSelfKVCache` / `ForwardDecoder` 的分配器改 CUDA allocator，消除每步 PCIe 搬运，修好后批量收益可恢复（长任务吞吐再上一层）。fork 内改动。
-5. **TensorRT EP**：安装 libnvinfer 后可用 TRT EP 试 encoder（静态形状分段或 profile 化）。
-6. **阶段 B（用户明确暂缓）**：改 onnxruntime 源码 —— 量化外围算子 GPU 化 / Memcpy 融合 / 显存池复用策略。只有在前几项穷尽后才有必要。
+另发现（长程任务实测，fp16 链路 3h48/3637 段）：ORT CUDA arena 对变化的分段 shape 只保留不释放，显存从 3305 MiB 长到 5354 MiB 稳定（6GB 卡内安全，更长任务需注意）——与 iOS 端 jetsam 观察到的 arena retention 同源；长音频 RTF 0.131 高于短音频 0.098，原因是语音占比更高（83% vs 69%）+ 分段长尾（均值 3.1s vs 1.7s，p99 14s）下 decoder 成本呈 a·d+b·d² 超线性（二次项来自每步 cross-attention 随段长增长 × 步数随段长正比；encoder 实测近似线性 ~79ms/秒音频，T=250~2000）。
 
-另发现（长程任务实测，3h48/3637 段）：ORT CUDA arena 对变化的分段 shape 只保留不释放，显存从 3305 MiB 长到 5354 MiB 稳定（6GB 卡内安全，更长任务需注意）——与 iOS 端 jetsam 观察到的 arena retention 同源；长音频 RTF 0.131 高于短音频 0.098，原因是语音占比更高（83% vs 69%）+ 分段长尾（均值 3.1s vs 1.7s，p99 14s）下 decoder 成本呈 a·d+b·d² 超线性（二次项来自每步 cross-attention 随段长增长 × 步数随段长正比；encoder 实测近似线性 ~79ms/秒音频，T=250~2000）。
+## 8. 复现指引
 
-## 7. 复现指引
-
+- fp32 encoder：远端 `~/firered-work/export_clean/encoder.fp32.onnx`（+3.10GB `.data`），onnx API load + save 单外部文件压实导出；生产位于 `models/zh/encoder.fp32.onnx`，回滚 = `server.py` 改回 `encoder.fp16.onnx`（或 cp `server.py.bak_fp32enc`）
 - fp16 模型转换：fork 仓库 `scripts/fire-red-asr/convert-fp16.py --dir <fp32 导出目录>`（提交 `ae0063f3`）
-- 服务端 A/B：远程机 `~/firered-work/run_ab.py`（3 轮 jobs RTF 中位 + md5 + VRAM 峰值）；单模型基准用 `~/firered-work/bench/` 下二进制
+- 服务端 A/B：远程机 `~/firered-work/run_ab.py`（3 轮 jobs RTF 中位 + md5 + VRAM 峰值）；单模型基准用 `~/firered-work/bench/` 下二进制；GEMM 微基准 `~/firered-work/cublas_probe/bench_cublas`
 - asr-service 侧的完整生产记录（环境变量、显存曲线、VAD 实测、卸载策略）见 asr-service README，本文只收 CUDA 平台优化主线
