@@ -256,12 +256,12 @@ class OfflineFireRedAsrModel::Impl {
       binding.BindOutput(decoder_output_names_ptr_[2], *cuda_mem_info_);
 
       binding.SynchronizeInputs();
-      decoder_sess_->Run(GetRunOptionsWithArenaShrinkage(), binding);
+      decoder_sess_->Run(GetDecoderRegularRunOptions(), binding);
       binding.SynchronizeOutputs();
       decoder_out = binding.GetOutputValues();
     } else {
       decoder_out = decoder_sess_->Run(
-          GetRunOptionsWithArenaShrinkage(), decoder_input_names_ptr_.data(),
+          GetDecoderRegularRunOptions(), decoder_input_names_ptr_.data(),
           decoder_input.data(), decoder_input.size(),
           decoder_output_names_ptr_.data(),
           decoder_output_names_ptr_.size());
@@ -815,6 +815,20 @@ class OfflineFireRedAsrModel::Impl {
       // Shrink arena to free unused memory blocks back to the OS.
       // This is cheaper than destroying and recreating the session.
       run_options.AddConfigEntry("memory.enable_memory_arena_shrinkage", "cpu:0");
+    }
+    return run_options;
+  }
+
+  // RunOptions for the decoder's regular (non-CUDA-graph) path. When the
+  // decoder session was created with enable_cuda_graph=1, a Run without a
+  // graph annotation defaults to annotation id 0: ORT counts such runs and
+  // eventually captures a graph for id 0 bound to this call's temporary
+  // buffers, then replays it on later runs. gpu_graph_id=-1
+  // (kCudaGraphAnnotationSkip) opts the run out of both capture and replay.
+  Ort::RunOptions GetDecoderRegularRunOptions() {
+    Ort::RunOptions run_options = GetRunOptionsWithArenaShrinkage();
+    if (use_cuda_graph_) {
+      run_options.AddConfigEntry("gpu_graph_id", "-1");
     }
     return run_options;
   }
