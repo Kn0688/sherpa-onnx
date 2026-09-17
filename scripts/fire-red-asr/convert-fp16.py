@@ -106,20 +106,20 @@ def uniquify_names(model):
     return tensor_fixes, node_fixes
 
 
-def convert(src_dir, name):
+def convert(src_dir, name, block_list=None, suffix=".fp16"):
     src = os.path.join(src_dir, f"{name}.onnx")
-    dst = os.path.join(src_dir, f"{name}.fp16.onnx")
+    dst = os.path.join(src_dir, f"{name}{suffix}.onnx")
     model = onnx.load(src, load_external_data=True)
     fp16 = float16.convert_float_to_float16(
         model,
         keep_io_types=True,
-        op_block_list=OP_BLOCK_LIST,
+        op_block_list=block_list if block_list is not None else OP_BLOCK_LIST,
         disable_shape_infer=True,  # shape inference chokes on >2GB external data
     )
     n_repaired = repair_dangling_graph_output_casts(fp16)
     t_fixes, n_fixes = uniquify_names(fp16)
     # Save exactly once, fresh .data file (bug 3: no dead bytes).
-    data_name = f"{name}.fp16.onnx.data"
+    data_name = f"{name}{suffix}.onnx.data"
     data_path = os.path.join(src_dir, data_name)
     if os.path.exists(data_path):
         os.remove(data_path)
@@ -135,9 +135,23 @@ def main():
     p.add_argument("--dir", required=True,
                    help="dir containing fp32 encoder.onnx and decoder.onnx "
                         "(from export-onnx.py)")
+    p.add_argument("--allow", default="",
+                   help="comma-separated ops to REMOVE from OP_BLOCK_LIST "
+                        "(i.e. allow them to go fp16), for guardrail-relaxation "
+                        "experiments. Each relaxation must be validated by "
+                        "token-identical recognition output.")
+    p.add_argument("--suffix", default=".fp16",
+                   help="output suffix: {name}{suffix}.onnx")
+    p.add_argument("--only", default="", choices=["", "encoder", "decoder"],
+                   help="convert only one model")
     args = p.parse_args()
-    convert(args.dir, "encoder")
-    convert(args.dir, "decoder")
+    block = [op for op in OP_BLOCK_LIST if op not in set(args.allow.split(","))]
+    if args.allow:
+        print(f"allowed to fp16: {args.allow}; remaining block list: {block}")
+    for name in ("encoder", "decoder"):
+        if args.only and name != args.only:
+            continue
+        convert(args.dir, name, block, args.suffix)
 
 
 if __name__ == "__main__":
