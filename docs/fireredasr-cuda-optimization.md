@@ -106,9 +106,14 @@ macOS 侧的结论"批量 1.2~1.5×"在 fp16 + CUDA 上**翻转**了。实测扫
 
 profiling 实证（2026-09-16,encoder fp16 T=500 CUDA,ORT profiler）：单次前向 kernel 时间 ~208ms vs 墙钟 396ms（**~47% 消耗在 kernel 间隙/launch 开销**）;kernel 时间内 Cast **33.7%**、Conv 17.1%、MatMul 仅 **13.7%**、Add/LN/mask 类 ~28%。并用 `SetOptimizedModelFilePath` dump 优化后图确认：**encoder 0 个 com.microsoft 融合节点**（相对位置编码注意力不匹配 ORT MHA fusion pattern）,decoder 有 32 个（16 层 self/cross 注意力已融合）。
 
-1. **消除 Cast 税（kernel 内的最大单块，33.7%）**:fp16 转换护栏（LayerNorm/Sigmoid/Softmax 保 fp32）造成 1554 次/3runs 的 Cast 边界。路径：逐算子验证精度后放宽 `op_block_list`（如 LN 允许 fp16 累加 fp32 的 CUDA 内核），或在导出层把敏感算子改为 fp16 安全写法。属 `convert-fp16.py`/`export-onnx.py` 层面。
-2. **CUDA Graph 消除 launch 开销（墙钟的 ~47%）**:encoder/decoder 每步形状固定即可捕获；分段 T 变化可用分桶 padding 解决。ORT provider option `enable_cuda_graph` + fork C++ 侧 IOBinding，不改 ORT 源码。
-3. **encoder 注意力融合**:dump 证实当前 0 融合；导出层改造让注意力匹配 ORT fused MHA pattern（或按 SDPA 形式导出）。当前注意力相关 elementwise/Transpose 占比可观，但 Softmax 本身仅 0.4%，收益需实测验证，排在 Cast 和 CUDA Graph 之后。
+**2026-09-17 探针修正（bench 实测，全在 fork ORT 1.27 CUDA EP）**:
+- **Cast 税是假象**：放宽护栏后 encoder 静态 Cast 871→199(-77%)，墙钟几乎不动（T=500: 396→394ms;T=2000: 1657→1639ms)。profiler 里的 Cast 耗时占比不等于墙钟影响。**此方向放弃**(fp16sl/fp16slx 变体在 `~/firered-work/export_clean/`，未采纳）
+- **encoder 是 kernel-work bound**:N=1→8 耗时近似线性（397/747/1504/2903ms);CUDA Graph 无效果（T=500: 393 vs 396ms;T=2000: 1646 vs 1657ms)
+- **decoder 是 launch bound,CUDA Graph 大胜**:固定形状（N=1, cache_len=150, cross T=500)IOBinding + `enable_cuda_graph=1` 实测 **23.32 → 7.66 ms/步（3.0×)**。这是当前最大的单项剩余杠杆
+
+1. **消除 Cast 税（已被 2026-09-17 探针证伪）**：见上方修正——Cast 减少 77% 墙钟不动，profiler kernel 占比误导。勿再投入。
+2. **CUDA Graph 用于 decoder（探针实测 3.0×，当前最大杠杆）**:decoder 每步 991 节点、launch bound;`enable_cuda_graph=1` + IOBinding 固定形状实测 23.32→7.66ms/步。落地需要 fork C++(`offline-fire-red-asr-model.cc`）把自回归循环改成 IOBinding + 静态 device buffer（每步输出拷回固定输入缓冲），形状按段变化（cache_len/Tc）需分桶 padding 控制 graph 数量。encoder 侧无效（已实测），不要给 encoder 开。
+3. **encoder 注意力融合**:dump 证实当前 0 融合；但生产分段短（均值 T≈311),T² 分数矩阵很小，MHA 融合对生产形状收益有限，优先级下调。encoder 现为 kernel-work bound，进一步收益需减少 elementwise kernel 数量（导出层融合 LN+Mul+Add 链等）。
 4. **fork C++ 批量路径 GPU-resident KV cache**:`GetInitialSelfKVCache` / `ForwardDecoder` 的分配器改 CUDA allocator，消除每步 PCIe 搬运，修好后批量收益可恢复（长任务吞吐再上一层）。fork 内改动。
 5. **TensorRT EP**：安装 libnvinfer 后可用 TRT EP 试 encoder（静态形状分段或 profile 化）。
 6. **阶段 B（用户明确暂缓）**：改 onnxruntime 源码 —— 量化外围算子 GPU 化 / Memcpy 融合 / 显存池复用策略。只有在前几项穷尽后才有必要。
