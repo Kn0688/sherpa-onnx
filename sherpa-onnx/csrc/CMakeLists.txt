@@ -464,6 +464,24 @@ else()
   target_link_libraries(sherpa-onnx-core ${onnxruntime_lib_files})
 endif()
 
+if(SHERPA_ONNX_ENABLE_GPU)
+  # Compile-time guard for GPU-only code paths (e.g. the FireRedASR decoder
+  # CUDA graph in offline-fire-red-asr-model.cc).
+  target_compile_definitions(sherpa-onnx-core PUBLIC SHERPA_ONNX_ENABLE_GPU=1)
+
+  # cudart is needed for cudaMemcpy in the decoder CUDA graph path. No CUDA
+  # toolkit headers are required; the runtime ABI is declared locally.
+  find_library(SHERPA_ONNX_CUDART_LIB
+    NAMES cudart libcudart.so.12
+    HINTS /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu
+  )
+  if(NOT SHERPA_ONNX_CUDART_LIB)
+    message(FATAL_ERROR "SHERPA_ONNX_ENABLE_GPU=ON but libcudart was not found")
+  endif()
+  message(STATUS "SHERPA_ONNX_CUDART_LIB ${SHERPA_ONNX_CUDART_LIB}")
+  target_link_libraries(sherpa-onnx-core ${SHERPA_ONNX_CUDART_LIB})
+endif()
+
 if(NOT WIN32)
   target_link_libraries(sherpa-onnx-core -lm)
 endif()
