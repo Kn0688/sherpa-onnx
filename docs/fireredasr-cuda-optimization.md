@@ -100,6 +100,7 @@ macOS 侧的结论"批量 1.2~1.5×"在 fp16 + CUDA 上**翻转**了。实测扫
 - **TU116 上指望 int8 硬件加速**：无 tensor core，int8 GEMM 不占便宜；且分离式 int8 在 CUDA EP 必掉 CPU（535 memcpy），打平 CPU（1055 vs 1213ms）
 - **VAD（silero v5）优化**：三条路径全部证伪。生产模型是 silero **v5**（非 v4）；官方 sequence 版与生产非等效（160s 中文 max prob diff 0.75，段数 127 vs 113）；非 512 chunk 喂入改变切分（64→23 段）。零数值损耗约束下无可做空间，收益上限本来就只有 ~0.6s/job
 - **TensorRT EP**：fork ORT 构建列出了 TRT EP，但系统无 libnvinfer，实际不可用；要用需先装 TensorRT
+- **`gpu_mem_limit` 封顶显存（两轮实测均不成立）**:fork `session.cc` 已支持 `SHERPA_ONNX_CUDA_GPU_MEM_LIMIT` / `SHERPA_ONNX_CUDA_ARENA_EXTEND_STRATEGY` 环境变量。实测：① 4GiB 无效——**BFCArena 按 OrtSession 独立**，encoder/decoder 各一个 arena，总量照样涨到 5337 MiB;② 2GiB/session 直接任务失败——**这版 ORT 1.27 超限没有 cudaMalloc 回退，Run 硬失败**(BFCArena "Available memory of 0")。且 arena 需求随段长变化，硬上限等于把显存增长换成随机挂任务。要封总量的正路是让 encoder/decoder session 共享同一个 CUDA allocator(ORT 支持 `CreateAllocator`+`RegisterAllocator`)，一个 arena 一个上限
 
 ## 6. CUDA 平台剩余路线图（按预期收益排序）
 
