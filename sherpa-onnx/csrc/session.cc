@@ -5,6 +5,7 @@
 #include "sherpa-onnx/csrc/session.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -327,6 +328,18 @@ Ort::SessionOptions GetSessionOptionsImpl(
           // Default OrtCudnnConvAlgoSearchExhaustive is extremely slow
           options.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
           // set more options on need
+        }
+
+        // Optional escape hatch from the BFC arena (default off, keeps the
+        // arena). The arena retains freed blocks per session, which grows
+        // GPU memory monotonically across variable input shapes and OOMed
+        // long jobs with the fp32 encoder on a 6GB card. With
+        // SHERPA_ONNX_CUDA_USE_ARENA=0, sessions use the raw
+        // cudaMalloc/cudaFree allocator registered in CreateOrtEnv()
+        // (ort-env.h), so GPU memory follows actual usage.
+        const char *no_arena = std::getenv("SHERPA_ONNX_CUDA_USE_ARENA");
+        if (no_arena != nullptr && std::atoi(no_arena) == 0) {
+          sess_opts.AddConfigEntry("session.use_env_allocators", "1");
         }
         sess_opts.AppendExecutionProvider_CUDA(options);
       } else {

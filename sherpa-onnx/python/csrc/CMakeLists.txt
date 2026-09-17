@@ -130,6 +130,12 @@ endif()
 
 target_link_libraries(_sherpa_onnx PRIVATE sherpa-onnx-core)
 
+if(SHERPA_ONNX_ENABLE_GPU)
+  # ort-env.h calls cudaMalloc/cudaFree directly for the optional raw
+  # allocator (SHERPA_ONNX_CUDA_USE_ARENA=0)
+  target_link_libraries(_sherpa_onnx PRIVATE cudart)
+endif()
+
 if(SHERPA_ONNX_HAS_ALSA)
   if(DEFINED ENV{SHERPA_ONNX_ALSA_LIB_DIR})
     target_link_libraries(_sherpa_onnx PRIVATE -L$ENV{SHERPA_ONNX_ALSA_LIB_DIR} -lasound)
