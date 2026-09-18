@@ -21,6 +21,7 @@
 - **3h48 长音频终验**：fp16 1720s(RTF 0.126)→ fp32+arena 56% 处 OOM → **fp32+禁 arena 797s 完成（RTF 0.057，比 fp16 快 2.2×）**，显存锯齿 4337~4797 MiB 用多少占多少，结束回落；74514 字，与 8 月旧版结果去标点相似度 94.9%（与 fp16 链路的 95.2% 同档，正常数值漂移）
 - 精度：160s / 800 字文本 md5 三轮全同（`8bd84d39…`），fp32 与 fp16/int8 链路**逐字节一致**，零损失
 - 显存峰值：fp32 链路 160s job 4365 MiB（禁 arena）/ 5337 MiB（arena）
+- **2026-09-18 批量复活实验（技术成立、未采纳）**：批量路径本就 GPU-resident（"每步 PCIe 搬运税"的前提证伪，见 §8）；fp32 decoder + 长度感知攒批 160s RTF 0.026（1.42×）且 md5 一致，但 6GB 卡上必须把 VAD 截到 10s 才安全（20s+ 巨段单跑都会 OOM）——按"截断不变"约束未采纳，已回退。**6GB 卡上批量方向关闭**
 - **2026-09-17 decoder CUDA Graph 实验：已实现、验证、移除**。墙钟零收益（生产 decoder 早已 GPU-resident 6.1ms/步），3h48 长任务反而 +4.6%，双路径复杂度不抵收益，代码已移除（见死路清单）。fork C++ 保持无功能性改动
 - **2026-09-17 重要更正**：此前"encoder 47% 墙钟消耗在 kernel 间隙"的结论是**测量错误**（ORT profiler 口径问题，见 §5）。真实根因是 fp16 GEMM 在无 tensor core 的 TU116 上比 fp32 慢 ~6×，直接催生了优化三
 
@@ -192,11 +193,11 @@ tensor-op math 无效（无 tensor core），ORT TunableOp 无效（396/397/397m
 - **CudaMempoolArena（cudaMallocAsync，2026-09-17 证伪）**：bench 里显存曲线完美（锯齿回落、耗时持平），但服务内 160s decode 实测**进程级崩溃**（ORT 1.27 `cuda_mempool_arena.cc:179` cudaFreeAsync illegal memory access，CUDA 700）。bench 复现不了生产崩溃条件，勿再启用；arena-off 的正解是 raw allocator（§6）
 - **decoder CUDA Graph（2026-09-17 完整落地验证后移除）**：在 fork `offline-fire-red-asr-model.cc` 实现了 decoder 自回归步的 CUDA Graph 捕获/回放（按桶后形状缓存 graph、固定 device buffer、D2D 回喂 self KV、MAX_CONTEXTS 上限 + 回退），数值验证完全正确（160s md5 `8bd84d39…` ×3;cn_2min 图开/关/回退触发三模式 md5 一致；3h48 74490 字、显存 5375 MiB 平台期不 OOM)。**但墙钟零收益**——生产 decoder 早已是 IOBinding + KV cache GPU-resident 的 6.1ms/步（GPU kernel-work 下限），graph replay 6.06ms/步；探针报告的 3.0× 对照组是非驻留路径，生产不存在那份税。唯一收益是 CPU 发射 991→1 次/步，单 worker 场景用不上；3h48 长任务反而 1799s vs 基线 1720s(+4.6%，每步 D2D 回喂拷贝的开销）。复杂度（双路径 + 下述 ORT 坑）不抵收益，代码已移除，如需复活见 git 历史 `9ae5c52a`+`af3abb12`。**ORT 1.27 关键坑（留给未来）**:graph 会话上不带 `gpu_graph_id` 的 Run 默认 annotation id=0,ORT 跑够 `min_num_runs_before_cuda_graph_capture` 次后会**静默为 id 0 捕获图**（绑定当次 Run 的临时 buffer)，后续 replay 输出不刷新 → `OrtValue Get<Tensor> on null` 崩溃；不参与 graph 的 Run 必须显式 `gpu_graph_id=-1`(`kCudaGraphAnnotationSkip`)
 
-## 8. 现状与剩余路线图（fp32 + 禁 arena 落地后重排，2026-09-17）
+## 8. 现状与剩余路线图（fp32 + 禁 arena 落地后，2026-09-18 更新）
 
 fp32 encoder 落地后 160s decode 从 ~15s 降到 5.79s，encoder 占比大幅下降，decoder（fp16，逐句 6.1ms/步）成为相对大头。剩余方向按现状排序：
 
-1. **fork C++ 批量路径 GPU-resident KV cache**：`GetInitialSelfKVCache` / `ForwardDecoder` 的分配器改 CUDA allocator，消除每步 PCIe 搬运。修好后批量收益可恢复，且批量形态下 decoder fp32 反而更快（1.47×，见 §5），精度选择需届时重测。这是目前唯一明确的结构性收益
+1. ~~**fork C++ 批量路径 GPU-resident KV cache**~~ **（2026-09-18 前提证伪，方向关闭）**：读码+实测确认 fork 批量路径**本就 GPU-resident**（上游 `711acccd` 的 IOBinding 已在部署代码里：encoder cross K/V 直绑 CUDA 内存、decoder self-KV 零拷贝回喂，每步 PCIe 仅 tokens/offset ~128B + logits D2H N=8 时 277KB）。批量慢的真因仍是 **fp16 GEMM 在无 tensor core 卡上慢 ~6×**（N=8 时 decoder fp16 96.5ms/步 vs fp32 21.8ms/步；逐句 N=1 带宽 bound 所以 fp16 才对）。**批量复活实验（技术成立、未采纳）**：fp32 decoder + 长度感知攒批（3000 帧×N 预算，长段自动缩批）+ VAD zh 截 10s，160s RTF **0.026（比逐句 0.037 快 1.42×）**且 md5 逐字节一致；但 3h48 858s（比逐句 797s 慢 7%，长段被帧预算压缩 + N=1 步 fp32 慢 8%），且 fp32 decoder 静态 4.95GB 下余量仅 ~1.19GB，20s+ 巨段单跑需求 ~1.23GB（encoder 瞬时 780MB + cross K/V 360MB）——**截 20s 时逐句也顶穿，必须截 10s**。用户约束"截断不变"→ 不采纳、已回退；fp32 decoder 模型与攒批 diff 留存远端（`~/firered-work`、asr-service 备份），换 ≥8GB 显存的卡可直接启用。**关键机制认知**：silero `max_speech_duration` 是软上限不是硬切（`voice-activity-detector.cc:50-65`：超时后 threshold 0.5→0.9、min_silence 0.25→0.1，找切点但不硬切），连续语音实测可长至 27.65s——显存规划必须按"段长无硬顶"做
 2. **decoder 逐句形态进一步压缩**：N=1 带宽 bound 下，减少每步权重读取是唯一方向（权重 int8 量化只省带宽不要 int8 GEMM——TU116 上 int8 无硬件加速但字节数减半，待测；注意与 §2 分离式 int8 的 memcpy 坑区分，这里指 weight-only QDQ 类方案）。禁 arena 后 decoder 每步还有 +11% 的真实分配开销，自定义轻量 pool 分配器是潜在回收点
 3. **encoder 侧**：fp32 后 T=500 仅 66ms，绝对空间已小；0 个 com.microsoft 融合节点（相对位置编码注意力不匹配 ORT MHA fusion pattern）的问题仍在，但生产均值段 T≈311 下收益有限，优先级低
 4. **阶段 B（ORT 源码级）**：最大杠杆（fp16 GEMM 死局）已被 fp32 绕过；显存封顶需求已被禁 arena 解决（§6）。剩余可选：量化外围算子 GPU 化（仅当 decoder 走 int8 权重路径时相关）
