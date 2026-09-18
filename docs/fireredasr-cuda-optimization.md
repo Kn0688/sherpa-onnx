@@ -82,7 +82,7 @@
 
 e2e 收益（−15%）小于单段收益（2.67×）的原因：批量解码已把 int8 的 per-run 拷贝税摊薄到 1/8，fp16 是摊薄后的净算力提升。**单段/小批量场景收益最大**（这直接引出了优化二）。
 
-**回滚**：生产保留 `server.py.bak_int8` 与 `models/zh/*.int8.onnx`，`_build_recognizer` 的 zh 分支改回 int8 文件名即可。
+**回滚**:`server.py.bak_int8` 保留;`models/zh/*.int8.onnx` 已于 2026-09-18 磁盘清理中删除，官方版可从 `backup_pre_fork_20260914/models_zh/` 拷回后把 `_build_recognizer` 的 zh 分支改回 int8 文件名。
 
 > **2026-09-17 更正**：本节原文假设"fp16 CUDA core 吞吐仍是 fp32 的 ~2×"——**对 GEMM 不成立**。cublas 在 TU116（无 tensor core）上 fp16 GEMM 实测仅 ~0.5 TFLOPS，而 fp32 SGEMM 有 3-4.5 TFLOPS，fp16 encoder 比 fp32 慢 ~6×（见 §5）。fp16 当时的 2.67× 是相对烂到底的 int8（535 memcpy）而言的；相对 fp32，fp16 是负优化。encoder 已换 fp32；decoder 因生产逐句 N=1 形态是带宽 bound（fp16 权重字节减半占优）维持 fp16。
 
@@ -130,7 +130,7 @@ tensor-op math 无效（无 tensor core），ORT TunableOp 无效（396/397/397m
 
 - 干净重导出 fp32 encoder：onnx API load + save（单外部数据文件），产物 `~/firered-work/export_clean/encoder.fp32.onnx` + `.data` = **3,103,167,616 字节 ≈ 3.10GB**（与 775.8M params × 4B 精确吻合；原 `out/encoder.onnx.data` 6.2GB 确系重复 append 的坏文件）。转换器坑 #3 的又一次印证：外部数据文件多次 save 会留死字节，导出后必须核对文件大小 ≈ 参数量 × 字节数
 - 数值验证：与生产 fp16 encoder 输出 cosine = **1.000000 / 0.999999 / 1.000000**（cross_k/cross_v/mask，T=300）；输出 dtype（fp32）与 decoder.fp16 输入完全匹配
-- 部署：`/home/kn/asr-service/models/zh/encoder.fp32.onnx`(+`.data`)，`server.py:127` 一行改指向（备份 `server.py.bak_fp32enc`；fp16 文件保留可回滚）
+- 部署：`/home/kn/asr-service/models/zh/encoder.fp32.onnx`(+`.data`)，`server.py:127` 一行改指向（备份 `server.py.bak_fp32enc`;fp16 文件已于 2026-09-18 清理，回滚需用 `convert-fp16.py` 重转）
 
 **实测（160s 生产 job，run_ab ×3）**：
 
@@ -208,7 +208,7 @@ fp32 encoder 落地后 160s decode 从 ~15s 降到 5.79s，encoder 占比大幅�
 ## 9. 复现指引
 
 - 禁 arena：fork `c95b3d8e` 起，`SHERPA_ONNX_CUDA_USE_ARENA=0` 环境变量（生产 `run.sh` 已内置）；不设则保持原 BFC arena 行为
-- fp32 encoder：远端 `~/firered-work/export_clean/encoder.fp32.onnx`（+3.10GB `.data`），onnx API load + save 单外部文件压实导出；生产位于 `models/zh/encoder.fp32.onnx`，回滚 = `server.py` 改回 `encoder.fp16.onnx`（或 cp `server.py.bak_fp32enc`）
+- fp32 encoder：远端 `~/firered-work/export_clean/encoder.fp32.onnx`（+3.10GB `.data`），onnx API load + save 单外部文件压实导出；生产位于 `models/zh/encoder.fp32.onnx`，回滚 = `server.py` 改回 `encoder.fp16.onnx`（或 cp `server.py.bak_fp32enc`;fp16 文件已清理，需先重转）
 - fp16 模型转换：fork 仓库 `scripts/fire-red-asr/convert-fp16.py --dir <fp32 导出目录>`（提交 `ae0063f3`）
 - 服务端 A/B：远程机 `~/firered-work/run_ab.py`（3 轮 jobs RTF 中位 + md5 + VRAM 峰值）；单模型基准用 `~/firered-work/bench/` 下二进制；GEMM 微基准 `~/firered-work/cublas_probe/bench_cublas`
 - asr-service 侧的完整生产记录（环境变量、显存曲线、VAD 实测、卸载策略）见 asr-service README，本文只收 CUDA 平台优化主线

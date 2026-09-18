@@ -85,4 +85,4 @@ en_3h40.m4a 截取前 12.5 分钟(ffmpeg,-ar 16000 mono),lang=other 走生产 jo
   ```
 - **生产 A/B**(~/firered-work/):`run_qwen3_baseline.py`(codeswitch ×3)、`run_qwen3_en90.py`(en_90s ×2)、`run_qwen3_long.py`(12.5min ×1)、`run_ab.py`(zh 回归红线 long_zh_3min ×3,md5 必须 `8bd84d39…`)。脚本自带 nvidia-smi 0.5s 采样报峰值
 - **fork 构建/安装**:远端 `~/Documents/github/sherpa-onnx-fireredasr/build-gpu && make -j8 _sherpa_onnx`,产物 cp 到 `venv/lib/python3.13/site-packages/sherpa_onnx/lib/`(**是 lib/ 子目录,不是包根**);venv 备份点 `sherpa_onnx.bak_qwen3kv`(Phase 1)/ `sherpa_onnx.bak_adaptivekv`(Phase 2)
-- **服务回滚 other 链路**:`cp app/server.py.bak_qwen3int8 app/server.py` + 重启,int8 三件套原位保留在 `models/other/`;`.so` 回滚用 `sherpa_onnx.bak_adaptivekv/lib/` 覆盖
+- **服务回滚 other 链路**:`cp app/server.py.bak_qwen3int8 app/server.py` + 重启;int8 三件套已于 2026-09-18 磁盘清理中删除,回滚需重新下载官方发布包(csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25)到 `models/other/`;`.so` 回滚用 `sherpa_onnx.bak_adaptivekv/lib/` 覆盖
