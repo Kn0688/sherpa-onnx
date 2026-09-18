@@ -1,6 +1,6 @@
 # Qwen3-ASR CUDA 平台优化记录(GTX 1660 SUPER 服务端)
 
-> 日期:2026-09-18 · 平台:Linux x86_64 + NVIDIA GTX 1660 SUPER 6GB(TU116,**无 tensor core**)· 代码:fork 分支 `fireredasr-batch-decoding`(commits `14301461..3e3b28ea`)
+> 日期:2026-09-18 · 平台:Linux x86_64 + NVIDIA GTX 1660 SUPER 6GB(TU116,**无 tensor core**)· 代码:fork 分支 `fireredasr-batch-decoding`(commits `02235571..3e3b28ea`)
 >
 > 对象:asr-service `lang=other`/`auto` 链路的 Qwen3-ASR-0.6B(conv_frontend + encoder + decoder 三件套)。与 `docs/fireredasr-cuda-optimization.md`(zh 链路)互补:根因同类(分离式 int8 与 CUDA EP 不适配),但解法形态不同——这边没有自写导出脚本,用的是社区导出工具 + fork C++ 两处 KV 路径改造。所有数字均为实测值。
 
@@ -35,7 +35,7 @@
 - **导出**:社区工具 [Wasser1462/Qwen3-ASR-onnx](https://github.com/Wasser1462/Qwen3-ASR-onnx),`python export_qwen3_asr_onnx.py --model ~/qwen3-work/Qwen3-ASR-0.6B --outdir ~/qwen3-work/export_fp32 --max-total-len 2048 --no-int8 --verify`(conda env `qwen3-asr`:torch 2.9.1 / transformers 4.57.6)。`--verify` 对 PyTorch 参考 **max_diff < 2e-5**。
 - **签名对齐**:导出前先用 `~/qwen3-work/dump_signature.py` 存档 int8 三件套 I/O 签名,导出后逐一比对(名字+shape)强制全等才许部署。期间修过 key_delta 输出 dim 符号名不一致的问题(导出侧修复,不动 sherpa 侧)。
 - **产物**(`models/other/fp32/`):conv_frontend 44MB + encoder 707MB + decoder 3.0GB。decoder 比"参数量×4"大是因为 embed/lm_head tie 权重未合并导出,可接受(磁盘不紧缺)。
-- **env 修复**(fork commits `14301461` + `02235571`):qwen3 模型类此前自建 `Ort::Env`,导致 `SHERPA_ONNX_CUDA_USE_ARENA=0`(zh 链路的 raw-allocator 开关,`c95b3d8e`)对它不生效;改为共享 `CreateOrtEnv()` 后生效。
+- **env 修复**(fork commit `02235571`):qwen3 模型类此前自建 `Ort::Env`,导致 `SHERPA_ONNX_CUDA_USE_ARENA=0`(zh 链路的 raw-allocator 开关,`c95b3d8e`)对它不生效;改为共享 `CreateOrtEnv()` 后生效。
 - **文本裁决**:int8→fp32 有个别 token 分叉(codeswitch 的法语段、en_90s 的标点/大小写),逐条列出后用户批准 fp32 文本为新基线(int8 与 PyTorch 参考本就有量化误差,fp32 `max_diff=0` 更贴近参考)。
 - **实测**:生产 A/B codeswitch 0.398 / en_90s 0.503(对 int8 为 1.78×/1.62×);直解 codeswitch 2.30s(cuda)。
 
