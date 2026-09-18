@@ -118,6 +118,23 @@ inline bool IsCudaProvider(const std::string &provider) {
   return p == "cuda" || (p.size() > 4 && p.find("cuda") == 0);
 }
 
+// Resolved at runtime from libcudart already loaded by the CUDA EP (same
+// pattern as ort-env.h); only used on the CUDA IOBinding path.
+extern "C" {
+int cudaMemset(void *devPtr, int value, size_t count);
+int cudaMemcpy(void *dst, const void *src, size_t count, int kind);
+int cudaDeviceSynchronize(void);
+}
+
+constexpr int kCudaMemcpyDeviceToDevice = 3;
+
+inline void CudaCheck(int err, const char *what) {
+  if (err != 0) {
+    SHERPA_ONNX_LOGE("%s failed with cuda error %d", what, err);
+    SHERPA_ONNX_EXIT(-1);
+  }
+}
+
 }  // namespace
 
 class OfflineQwen3ASRModel::Impl {
@@ -196,6 +213,15 @@ class OfflineQwen3ASRModel::Impl {
     InitIoBindingConfig();
   }
 
+  ~Impl() {
+    // KV cache tensors created from this allocator are all scoped to
+    // GenerateText() and are gone before the model is destroyed.
+    if (cuda_allocator_ != nullptr) {
+      Ort::GetApi().ReleaseAllocator(cuda_allocator_);
+      cuda_allocator_ = nullptr;
+    }
+  }
+
  private:
   void InitIoBindingConfig() {
     use_cuda_iobinding_ =
@@ -203,6 +229,12 @@ class OfflineQwen3ASRModel::Impl {
     if (use_cuda_iobinding_) {
       cuda_mem_info_ = std::make_unique<Ort::MemoryInfo>(
           "Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault);
+      // Device allocator honoring the env-registered raw allocator when
+      // SHERPA_ONNX_CUDA_USE_ARENA=0 (sessions opt in via
+      // session.use_env_allocators=1, see session.cc). Used to allocate the
+      // GPU-resident KV cache.
+      Ort::ThrowOnError(Ort::GetApi().CreateAllocator(
+          *decoder_sess_, *cuda_mem_info_, &cuda_allocator_));
     }
   }
 
@@ -470,9 +502,13 @@ class OfflineQwen3ASRModel::Impl {
       for (size_t i = 0; i < inputs.size(); ++i) {
         binding.BindInput(input_names_ptr[i], inputs[i]);
       }
+      // logits must stay on CPU for sampling; KV deltas stay on device and
+      // are written back into the GPU-resident cache with a D2D copy in
+      // ApplyKvDeltaInplace, eliminating the per-step ~470MB H2D upload of
+      // the full KV cache plus the per-step delta D2H.
       binding.BindOutput(decoder_output_names_ptr_[0], cpu_mem_info_);
       for (size_t i = 1; i < decoder_output_names_ptr_.size(); ++i) {
-        binding.BindOutput(decoder_output_names_ptr_[i], cpu_mem_info_);
+        binding.BindOutput(decoder_output_names_ptr_[i], *cuda_mem_info_);
       }
       binding.SynchronizeInputs();
       decoder_sess_->Run(Ort::RunOptions{nullptr}, binding);
@@ -551,33 +587,58 @@ class OfflineQwen3ASRModel::Impl {
     size_t key_numel = NumelFromShape(key_shape);
     size_t value_numel = NumelFromShape(value_shape);
 
+    // CUDA path: keep the cache on device so that per-step ForwardLLM binds
+    // it with zero host-to-device copies. CPU path is unchanged.
+    OrtAllocator *kv_alloc =
+        use_cuda_iobinding_ ? cuda_allocator_ : static_cast<OrtAllocator *>(allocator_);
+
     for (int32_t i = 0; i < num_layers_; ++i) {
       Ort::Value key_tensor =
-          AllocTensorByElemType(allocator_, key_shape, kv_in_type_);
+          AllocTensorByElemType(kv_alloc, key_shape, kv_in_type_);
       Ort::Value value_tensor =
-          AllocTensorByElemType(allocator_, value_shape, kv_in_type_v_);
+          AllocTensorByElemType(kv_alloc, value_shape, kv_in_type_v_);
 
-      if (key_numel > 0) {
-        if (kv_in_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-          std::memset(key_tensor.GetTensorMutableData<float>(), 0,
-                      key_numel * sizeof(float));
-        } else {
-          std::memset(key_tensor.GetTensorMutableData<uint16_t>(), 0,
-                      key_numel * sizeof(uint16_t));
+      if (use_cuda_iobinding_) {
+        if (key_numel > 0) {
+          CudaCheck(cudaMemset(key_tensor.GetTensorMutableData<void>(), 0,
+                               key_numel * ElemBytesFromTensorType(kv_in_type_)),
+                    "cudaMemset(cache_key)");
         }
-      }
+        if (value_numel > 0) {
+          CudaCheck(
+              cudaMemset(value_tensor.GetTensorMutableData<void>(), 0,
+                         value_numel * ElemBytesFromTensorType(kv_in_type_v_)),
+              "cudaMemset(cache_value)");
+        }
+      } else {
+        if (key_numel > 0) {
+          if (kv_in_type_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+            std::memset(key_tensor.GetTensorMutableData<float>(), 0,
+                        key_numel * sizeof(float));
+          } else {
+            std::memset(key_tensor.GetTensorMutableData<uint16_t>(), 0,
+                        key_numel * sizeof(uint16_t));
+          }
+        }
 
-      if (value_numel > 0) {
-        if (kv_in_type_v_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-          std::memset(value_tensor.GetTensorMutableData<float>(), 0,
-                      value_numel * sizeof(float));
-        } else {
-          std::memset(value_tensor.GetTensorMutableData<uint16_t>(), 0,
-                      value_numel * sizeof(uint16_t));
+        if (value_numel > 0) {
+          if (kv_in_type_v_ == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+            std::memset(value_tensor.GetTensorMutableData<float>(), 0,
+                        value_numel * sizeof(float));
+          } else {
+            std::memset(value_tensor.GetTensorMutableData<uint16_t>(), 0,
+                        value_numel * sizeof(uint16_t));
+          }
         }
       }
 
       kv_cache.emplace_back(std::move(key_tensor), std::move(value_tensor));
+    }
+
+    if (use_cuda_iobinding_) {
+      // The memsets above run on the legacy default stream while ORT runs on
+      // its own stream; sync once so the first ForwardLLM sees zeroed cache.
+      CudaCheck(cudaDeviceSynchronize(), "cudaDeviceSynchronize(kv memset)");
     }
     return kv_cache;
   }
@@ -744,9 +805,25 @@ class OfflineQwen3ASRModel::Impl {
         const uint8_t *src_v_ptr =
             static_cast<const uint8_t *>(src_v) + src_v_off;
 
-        std::memcpy(dst_k_ptr, src_k_ptr, copy_k_bytes);
-        std::memcpy(dst_v_ptr, src_v_ptr, copy_v_bytes);
+        if (use_cuda_iobinding_) {
+          CudaCheck(cudaMemcpy(dst_k_ptr, src_k_ptr, copy_k_bytes,
+                               kCudaMemcpyDeviceToDevice),
+                    "cudaMemcpy(kv key delta)");
+          CudaCheck(cudaMemcpy(dst_v_ptr, src_v_ptr, copy_v_bytes,
+                               kCudaMemcpyDeviceToDevice),
+                    "cudaMemcpy(kv value delta)");
+        } else {
+          std::memcpy(dst_k_ptr, src_k_ptr, copy_k_bytes);
+          std::memcpy(dst_v_ptr, src_v_ptr, copy_v_bytes);
+        }
       }
+    }
+
+    if (use_cuda_iobinding_) {
+      // The D2D copies above run on the legacy default stream while ORT runs
+      // on its own stream; sync once per step so the next ForwardLLM run
+      // observes the updated cache.
+      CudaCheck(cudaDeviceSynchronize(), "cudaDeviceSynchronize(kv delta)");
     }
   }
 
@@ -788,6 +865,9 @@ class OfflineQwen3ASRModel::Impl {
   Ort::AllocatorWithDefaultOptions allocator_;
   Ort::MemoryInfo cpu_mem_info_;
   std::unique_ptr<Ort::MemoryInfo> cuda_mem_info_;
+  // Device allocator for the GPU-resident KV cache (created from the decoder
+  // session via OrtApi::CreateAllocator); nullptr on the CPU path.
+  OrtAllocator *cuda_allocator_ = nullptr;
 
   bool is_cpu_provider_ = true;
   bool use_cuda_iobinding_ = false;
