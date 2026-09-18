@@ -728,8 +728,6 @@ OfflineRecognitionResult OfflineRecognizerQwen3ASRImpl::GenerateText(
     return result;
   }
 
-  std::vector<std::pair<Ort::Value, Ort::Value>> cache_kv =
-      model_->CreateEmptyKVCache(1);
   const int32_t model_max_len = model_->GetMaxTotalLen();
   int32_t max_seq_len = model_max_len;
   const int32_t max_total_len_opt =
@@ -828,6 +826,22 @@ OfflineRecognitionResult OfflineRecognizerQwen3ASRImpl::GenerateText(
           std::move(trimmed_audio_features), keep_audio, model_->Allocator());
     }
   }
+
+  // Adaptive per-stream KV allocation: the decode loop writes at most
+  // max_new_tokens positions past the prompt, so size the cache to
+  // context_len + max_new_tokens + 8 (margin) instead of the full
+  // max_total_len. The decoder's cache seq axis is dynamic, so ORT needs no
+  // change. (Same idea as the FireRedASR min(max_len, estimated+4) cache.)
+  const int32_t alloc_len =
+      std::min(max_seq_len, context_len + max_new_tokens + 8);
+  if (config_.model_config.debug) {
+    SHERPA_ONNX_LOGE(
+        "qwen3-asr: adaptive KV alloc_len=%d (context_len=%d "
+        "max_new_tokens=%d max_total_len=%d)",
+        alloc_len, context_len, max_new_tokens, max_seq_len);
+  }
+  std::vector<std::pair<Ort::Value, Ort::Value>> cache_kv =
+      model_->CreateEmptyKVCache(1, alloc_len);
 
   std::vector<int64_t> input_ids = source_ids;
   std::array<int64_t, 2> ids_shape{1, context_len};

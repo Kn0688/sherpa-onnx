@@ -569,7 +569,11 @@ class OfflineQwen3ASRModel::Impl {
   }
 
   std::vector<std::pair<Ort::Value, Ort::Value>> CreateEmptyKVCache(
-      int64_t batch) {
+      int64_t batch, int32_t alloc_len) {
+    if (alloc_len <= 0 || alloc_len > max_total_len_) {
+      alloc_len = max_total_len_;
+    }
+
     std::vector<std::pair<Ort::Value, Ort::Value>> kv_cache;
     kv_cache.reserve(num_layers_);
 
@@ -580,8 +584,8 @@ class OfflineQwen3ASRModel::Impl {
     }
     int64_t kv_h = tpl[2];
     int64_t hd = tpl[3];
-    std::vector<int64_t> key_shape = {
-        batch, static_cast<int64_t>(max_total_len_), kv_h, hd};
+    std::vector<int64_t> key_shape = {batch, static_cast<int64_t>(alloc_len),
+                                      kv_h, hd};
     std::vector<int64_t> value_shape = key_shape;
 
     size_t key_numel = NumelFromShape(key_shape);
@@ -688,14 +692,6 @@ class OfflineQwen3ASRModel::Impl {
                        static_cast<int32_t>(pos0));
       SHERPA_ONNX_EXIT(-1);
     }
-    if (pos0 + S > max_total_len_) {
-      SHERPA_ONNX_LOGE(
-          "ApplyKvDeltaInplace: pos0+S exceeds max_total_len_ (%d + %d > "
-          "%d), clamping S",
-          static_cast<int32_t>(pos0), static_cast<int32_t>(S), max_total_len_);
-      S = max_total_len_ - pos0;
-      if (S <= 0) return;
-    }
 
     for (int32_t layer = 0; layer < num_layers_; ++layer) {
       Ort::Value &cache_key = (*cache_kv)[layer].first;
@@ -717,10 +713,18 @@ class OfflineQwen3ASRModel::Impl {
       }
 
       int64_t B = ck_shape[0];
+      int64_t cache_len = ck_shape[1];
       int64_t kv_h = ck_shape[2];
       int64_t hd = ck_shape[3];
-      if (B <= 0 || kv_h <= 0 || hd <= 0) {
+      if (B <= 0 || cache_len <= 0 || kv_h <= 0 || hd <= 0) {
         SHERPA_ONNX_LOGE("ApplyKvDeltaInplace: invalid cache key shape");
+        SHERPA_ONNX_EXIT(-1);
+      }
+
+      if (cv_shape[1] != cache_len) {
+        SHERPA_ONNX_LOGE(
+            "ApplyKvDeltaInplace: cache key/value seq len mismatch: %d vs %d",
+            static_cast<int32_t>(cache_len), static_cast<int32_t>(cv_shape[1]));
         SHERPA_ONNX_EXIT(-1);
       }
 
@@ -775,13 +779,21 @@ class OfflineQwen3ASRModel::Impl {
       const void *src_v = delta_val.GetTensorData<void>();
 
       int64_t copy_s = std::min<int64_t>(S, dk_shape[1]);
+      if (pos0 + copy_s > cache_len) {
+        SHERPA_ONNX_LOGE(
+            "ApplyKvDeltaInplace: pos0+S exceeds cache capacity (%d + %d > "
+            "%d), clamping S",
+            static_cast<int32_t>(pos0), static_cast<int32_t>(copy_s),
+            static_cast<int32_t>(cache_len));
+        copy_s = cache_len - pos0;
+      }
       if (copy_s <= 0) {
         continue;
       }
 
       for (int64_t b = 0; b < B; ++b) {
         size_t dst_k_off =
-            (static_cast<size_t>(b) * static_cast<size_t>(max_total_len_) +
+            (static_cast<size_t>(b) * static_cast<size_t>(cache_len) +
              static_cast<size_t>(pos0)) *
             key_bytes_per_pos;
         size_t src_k_off =
@@ -790,7 +802,7 @@ class OfflineQwen3ASRModel::Impl {
         size_t copy_k_bytes = static_cast<size_t>(copy_s) * key_bytes_per_pos;
 
         size_t dst_v_off =
-            (static_cast<size_t>(b) * static_cast<size_t>(max_total_len_) +
+            (static_cast<size_t>(b) * static_cast<size_t>(cache_len) +
              static_cast<size_t>(pos0)) *
             value_bytes_per_pos;
         size_t src_v_off =
@@ -909,8 +921,8 @@ OfflineQwen3ASRModel::ForwardLLM(
 }
 
 std::vector<std::pair<Ort::Value, Ort::Value>>
-OfflineQwen3ASRModel::CreateEmptyKVCache(int64_t batch) {
-  return impl_->CreateEmptyKVCache(batch);
+OfflineQwen3ASRModel::CreateEmptyKVCache(int64_t batch, int32_t alloc_len) {
+  return impl_->CreateEmptyKVCache(batch, alloc_len);
 }
 
 void OfflineQwen3ASRModel::ApplyKvDeltaInplace(

@@ -60,14 +60,18 @@ class OfflineQwen3ASRModel {
              Ort::Value attention_mask, const Ort::Value &cache_position,
              const std::vector<std::pair<Ort::Value, Ort::Value>> &cache_kv);
 
-  /** Create fixed-size KV cache buffer.
+  /** Create KV cache buffer.
    *
    * @param batch  Batch size (usually 1).
-   * @return Return vector of (key, value) pairs with fixed cache dimensions [B,
-   * max_total_len, kv_h, hd].
+   * @param alloc_len  Sequence capacity of the cache. Values <= 0 or greater
+   * than max_total_len are clamped to max_total_len. Pass a per-stream
+   * estimate (e.g. context_len + max_new_tokens + margin) to avoid allocating
+   * the full max_total_len for short utterances.
+   * @return Return vector of (key, value) pairs with cache dimensions [B,
+   * alloc_len, kv_h, hd].
    */
   std::vector<std::pair<Ort::Value, Ort::Value>> CreateEmptyKVCache(
-      int64_t batch);
+      int64_t batch, int32_t alloc_len);
 
   /** Apply KV delta in-place to KV cache buffer.
    *
