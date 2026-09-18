@@ -22,14 +22,14 @@
 **Files:**
 - Create(远端): `~/qwen3-work/`(本轮工作目录,与 firered-work 并列)
 
-- [ ] **Step 1: 建工作目录 + 确认 conda env 可用**
+- [x] **Step 1: 建工作目录 + 确认 conda env 可用**
 
 ```bash
 ssh kn@100.64.0.2 'mkdir -p ~/qwen3-work && source /home/kn/miniconda3/etc/profile.d/conda.sh && conda activate qwen3-asr && python -c "import torch, transformers; print(torch.__version__, transformers.__version__)" && python -c "import modelscope; print(modelscope.__version__)" 2>&1 | tail -1'
 ```
 Expected: `2.9.1 4.57.6` + modelscope 版本号。若 modelscope 缺失:`pip install modelscope`(conda env 内)。
 
-- [ ] **Step 2: 下载 Qwen/Qwen3-ASR-0.6B 权重(优先 ModelScope)**
+- [x] **Step 2: 下载 Qwen/Qwen3-ASR-0.6B 权重(优先 ModelScope)**
 
 ```bash
 ssh kn@100.64.0.2 'source /home/kn/miniconda3/etc/profile.d/conda.sh && conda activate qwen3-asr && modelscope download --model Qwen/Qwen3-ASR-0.6B --local_dir ~/qwen3-work/Qwen3-ASR-0.6B'
@@ -38,7 +38,7 @@ ssh kn@100.64.0.2 'source /home/kn/miniconda3/etc/profile.d/conda.sh && conda ac
 Expected: `~/qwen3-work/Qwen3-ASR-0.6B/` 下有 `config.json` + `*.safetensors`(合计 ~1.2GB)+ tokenizer 文件。
 验证: `ls -la ~/qwen3-work/Qwen3-ASR-0.6B/ && du -sh ~/qwen3-work/Qwen3-ASR-0.6B`
 
-- [ ] **Step 3: 取导出工具(Wasser1462/Qwen3-ASR-onnx)**
+- [x] **Step 3: 取导出工具(Wasser1462/Qwen3-ASR-onnx)**
 
 ```bash
 ssh kn@100.64.0.2 'cd ~/qwen3-work && git clone https://github.com/Wasser1462/Qwen3-ASR-onnx.git export-tool 2>&1 | tail -2; ls export-tool/'
@@ -54,7 +54,7 @@ Expected: 含 `export_qwen3_asr_onnx.py`、`conv_frontend.py`、`encoder.py`、`
 **Files:**
 - Create(远端): `~/qwen3-work/dump_signature.py`
 
-- [ ] **Step 1: 写签名提取脚本**
+- [x] **Step 1: 写签名提取脚本**
 
 ```python
 #!/usr/bin/env python3
@@ -78,14 +78,14 @@ out = [dump(p) for p in sys.argv[1:]]
 print(json.dumps(out, indent=1))
 ```
 
-- [ ] **Step 2: 跑签名提取并存档**
+- [x] **Step 2: 跑签名提取并存档**
 
 ```bash
 ssh kn@100.64.0.2 'cd ~/qwen3-work && /home/kn/asr-service/venv/bin/python dump_signature.py /home/kn/asr-service/models/other/conv_frontend.onnx /home/kn/asr-service/models/other/encoder.int8.onnx /home/kn/asr-service/models/other/decoder.int8.onnx > qwen3_int8_signature.json && head -50 qwen3_int8_signature.json'
 ```
 Expected: decoder 输入含 `input_ids`/`audio_features`/`attention_mask`/`cache_position` + `cache_key_0..27`/`cache_value_0..27`(shape `[batch, max_total_len, 8, 128]`,dtype float32);输出 `logits` + `key_delta_*`/`value_delta_*`。**此 JSON 是 Phase 1 导出对齐的基准。**
 
-- [ ] **Step 3: 存 int8 参考中间输出(供 Phase 1 cosine 对比)**
+- [x] **Step 3: 存 int8 参考中间输出(供 Phase 1 cosine 对比)**
 
 用 `bench_qwen3_direct.py` 的加载方式,写 `~/qwen3-work/save_int8_ref.py`:对 codeswitch.wav 跑 conv_frontend → encoder.int8,把 conv 输出(`conv_output`)与 encoder.int8 输出(`audio_features`)各存一份 `.npy` 到 `~/qwen3-work/ref/`(ORT CPU provider 跑,避免 CUDA 分区干扰参考值)。
 Expected: `~/qwen3-work/ref/conv_output.npy`、`ref/encoder_int8_audio_features.npy`。
@@ -98,14 +98,14 @@ Expected: `~/qwen3-work/ref/conv_output.npy`、`ref/encoder_int8_audio_features.
 - 用远端 `~/qwen3-work/export-tool/export_qwen3_asr_onnx.py`(不改动,直接用)
 - Create(远端): `~/qwen3-work/export_fp32/`(产物目录)
 
-- [ ] **Step 1: 运行导出(只导 fp32,max_total_len=2048 对齐生产)**
+- [x] **Step 1: 运行导出(只导 fp32,max_total_len=2048 对齐生产)**
 
 ```bash
 ssh kn@100.64.0.2 'source /home/kn/miniconda3/etc/profile.d/conda.sh && conda activate qwen3-asr && cd ~/qwen3-work/export-tool && python export_qwen3_asr_onnx.py --model ~/qwen3-work/Qwen3-ASR-0.6B --outdir ~/qwen3-work/export_fp32 --max-total-len 2048 --no-int8 --verify 2>&1 | tail -30'
 ```
 Expected: `[verify] encoder max_diff` / `[verify] decoder max_diff` 均 < 1e-4;产物 `conv_frontend.onnx`、`encoder.onnx(+ .data)`、`decoder.onnx(+ .data)`。导出耗时可能 10-30 分钟,SSH 用 nohup 或加大超时。
 
-- [ ] **Step 2: 签名校验 — 与 int8 基准逐一比对**
+- [x] **Step 2: 签名校验 — 与 int8 基准逐一比对**
 
 ```bash
 ssh kn@100.64.0.2 'cd ~/qwen3-work && /home/kn/asr-service/venv/bin/python dump_signature.py export_fp32/conv_frontend.onnx export_fp32/encoder.onnx export_fp32/decoder.onnx > qwen3_fp32_signature.json && /home/kn/asr-service/venv/bin/python - <<EOF
@@ -122,7 +122,7 @@ EOF'
 ```
 Expected: 三个文件全部"签名一致"(名字+shape;dtype 允许 int8 图是 fp32 输入输出——分离式量化 IO 本就是 fp32)。**不匹配则停,改导出参数/脚本直到匹配,不动 sherpa 侧。**
 
-- [ ] **Step 3: 文件体积核验(fireredasr 教训:外部数据文件必须 ≈ 参数量×4)**
+- [x] **Step 3: 文件体积核验(fireredasr 教训:外部数据文件必须 ≈ 参数量×4)**
 
 ```bash
 ssh kn@100.64.0.2 'ls -la ~/qwen3-work/export_fp32/'
@@ -136,12 +136,12 @@ Expected: encoder.onnx+.data ≈ 700-800MB;decoder.onnx+.data ≈ 2.2-2.6GB;conv
 **Files:**
 - Create(远端): `~/qwen3-work/verify_fp32.py`
 
-- [ ] **Step 1: encoder 级 cosine 对比**
+- [x] **Step 1: encoder 级 cosine 对比**
 
 `verify_fp32.py` 第一段:加载 `ref/conv_output.npy` 喂 export_fp32/encoder.onnx(ORT CPU),与 `ref/encoder_int8_audio_features.npy` 算 cosine 相似度(注意 int8 与 fp32 数值本有差异,cosine 期望 > 0.999;若 < 0.99 说明导出错误而非量化误差)。
 Run: `ssh kn@100.64.0.2 'cd ~/qwen3-work && /home/kn/asr-service/venv/bin/python verify_fp32.py'`
 
-- [ ] **Step 2: 端到端直解文本对比**
+- [x] **Step 2: 端到端直解文本对比**
 
 扩展(或复制)`bench_qwen3_direct.py` 指向 fp32 三件套,直解 codeswitch.wav 与 en_90s.wav(与基线脚本同管线同参数),文本写入 `~/qwen3-work/fp32_codeswitch.txt`、`fp32_en90s.txt`:
 
@@ -150,7 +150,7 @@ ssh kn@100.64.0.2 'cd ~/qwen3-work && diff ~/firered-work/qwen3_codeswitch_basel
 ```
 Expected: 逐字节一致。**若有 token 分叉:逐条列出(diff 输出),记入结果,交用户裁决后继续。**
 
-- [ ] **Step 3: 直解速度对比**
+- [x] **Step 3: 直解速度对比**
 
 同一脚本记录 fp32 直解耗时(cuda provider)vs 调查基线(codeswitch cuda 3.99s / cpu4 1.34s;en_90s cuda ~73s)。
 Expected: fp32+cuda 显著快于 int8+cuda;记录数字。
@@ -163,24 +163,24 @@ Expected: fp32+cuda 显著快于 int8+cuda;记录数字。
 - Modify(远端): `/home/kn/asr-service/app/server.py`(`from_qwen3_asr` 的文件名两行,约 :152-153)
 - 备份: `cp app/server.py app/server.py.bak_qwen3int8`
 
-- [ ] **Step 1: 部署模型文件**
+- [x] **Step 1: 部署模型文件**
 
 ```bash
 ssh kn@100.64.0.2 'mkdir -p /home/kn/asr-service/models/other/fp32 && cp ~/qwen3-work/export_fp32/conv_frontend.onnx ~/qwen3-work/export_fp32/encoder.onnx* ~/qwen3-work/export_fp32/decoder.onnx* /home/kn/asr-service/models/other/fp32/ && ls -la /home/kn/asr-service/models/other/fp32/'
 ```
 (int8 三件套保留在原位,回滚用。)
 
-- [ ] **Step 2: server.py 指向 fp32(备份先行)**
+- [x] **Step 2: server.py 指向 fp32(备份先行)**
 
 `from_qwen3_asr(...)` 改为 `conv_frontend=str(d/"fp32"/"conv_frontend.onnx"), encoder=str(d/"fp32"/"encoder.onnx"), decoder=str(d/"fp32"/"decoder.onnx")`。
 
-- [ ] **Step 3: 重启 + A/B**
+- [x] **Step 3: 重启 + A/B**
 
 停服务 → 启动 → `run_qwen3_baseline.py` ×3 + `run_qwen3_en90.py` ×2,记录 RTF 中位、文本 md5 对比 `~/firered-work/qwen3_*_baseline.txt`、nvidia-smi 0.5s 采样峰值。
 Expected: 文本规则同 Task 4;显存红线 ≤ ~5GB(预计 3-4GB);RTF 显著下降。
 健康检查: `curl -s http://127.0.0.1:8000/health`(路径以 server.py 实际为准)。
 
-- [ ] **Step 4: 阶段报告 + 提交**
+- [x] **Step 4: 阶段报告 + 提交**
 
 把数字汇报给用户(RTF/显存/文本对比)。fork 仓库无需提交(Phase 1 零代码);asr README 的更新统一放 Task 8。
 
@@ -194,11 +194,11 @@ Expected: 文本规则同 Task 4;显存红线 ≤ ~5GB(预计 3-4GB);RTF 显著�
 - 模板参照: `sherpa-onnx/csrc/offline-fire-red-asr-model.cc`(IOBinding GPU-resident:device 侧 Ort::Value 直绑、零拷贝回喂)
 - 本地 worktree: `/Users/feiguodong1/Documents/github/deep-dive-inference/sherpa-onnx-batch-wt`(分支 `fireredasr-batch-decoding`)
 
-- [ ] **Step 1: 读码定稿**
+- [x] **Step 1: 读码定稿**
 
 读 `offline-qwen3-asr-model.{h,cc}` 全文 + FireRedASR 的 IOBinding 段落,确认:当前 cache 分配方式、每步 BindInput/BindOutput 列表、`ApplyKvDeltaInplace` 的写回语义(delta 写入 cache 的偏移规则 = `cache_position`)。
 
-- [ ] **Step 2: 实现(仅 `use_cuda_iobinding_==true` 路径改行为,CPU provider 路径保持原样)**
+- [x] **Step 2: 实现(仅 `use_cuda_iobinding_==true` 路径改行为,CPU provider 路径保持原样)**
 
 契约:
 1. KV cache 用 session 的 CUDA allocator 分配(device Ort::Value),不再用 `Ort::AllocatorWithDefaultOptions`;
@@ -207,18 +207,20 @@ Expected: 文本规则同 Task 4;显存红线 ≤ ~5GB(预计 3-4GB);RTF 显著�
 4. encoder 输出 `audio_features` 保持 device 驻留,不再绑回 CPU(原 :391 / :471-474 的 cpu_mem_info_ 输出绑定移除);
 5. 删除/旁路 `ApplyKvDeltaInplace` 的 CPU 路径(cuda 分支)。
 
-- [ ] **Step 3: 远端构建 + 装入 venv**
+- [x] **Step 3: 远端构建 + 装入 venv**
 
 fork 构建流程沿用 fireredasr 时的方式(远端 build-gpu 目录增量构建,或 `SHERPA_ONNX_CMAKE_ARGS="-DSHERPA_ONNX_ENABLE_GPU=ON" python3 setup.py bdist_wheel` 后 pip install --force-reinstall 到 asr-service venv)。构建产物必须含 qwen3-asr 改动;装前备份 venv 的 sherpa_onnx 目录(`cp -r sherpa_onnx sherpa_onnx.bak_qwen3kv`)。
 
-- [ ] **Step 4: 验证(文本必须 == Phase 1 fp32 文本)**
+- [x] **Step 4: 验证(文本必须 == Phase 1 fp32 文本)**
 
 `bench_qwen3_direct.py` 直解 codeswitch + en_90s(fp32 模型,cuda):文本与 `~/qwen3-work/fp32_*.txt` **逐字节一致**(纯搬运路径改动,数值不变,此关必须全等);记录 RTF 变化。
 Expected: en_90s 级长音频明显提速(210GB H2D 消除);短音频小幅提速。
 
-- [ ] **Step 5: 生产部署 + A/B + 提交**
+- [x] **Step 5: 生产部署 + A/B + 提交**
 
 重启服务跑 §Task5 Step3 同款 A/B;显存采样(预期 +470MB/流 量级);fork 仓库 commit(信息示例:`qwen3-asr: GPU-resident KV cache via IOBinding (eliminate ~470MB/step H2D)`),push `fireredasr-batch-decoding`。
+
+> **完成备注(2026-09-18,commit `271e0506`)**:契约 4 有记录在案的偏离——encoder 输出 `audio_features` 仍绑回 CPU,因为 `TrimAudioFeatures`(impl 侧)需要在 CPU 上扫描有效帧;audio_features 每步重传仅 ~6MB/step(vs KV 470MB/step),代价可忽略,impl 文件零改动。实测显存峰值基本持平(+470MB KV 驻留被每步 H2D 暂存消除抵消)。部署坑:venv 实际加载 `sherpa_onnx/lib/_sherpa_onnx*.so`,不是包根那份。
 
 ---
 
@@ -227,15 +229,15 @@ Expected: en_90s 级长音频明显提速(210GB H2D 消除);短音频小幅提�
 **Files:**
 - Modify: `sherpa-onnx/csrc/offline-qwen3-asr-model.cc`(`CreateEmptyKVCache` 增加 alloc_len 参数)及调用处(`offline-recognizer-qwen3-asr-impl.cc` 的 GenerateText/prefill 段)
 
-- [ ] **Step 1: 实现**
+- [x] **Step 1: 实现**
 
 契约:每流 KV 分配长度 = `min(max_total_len, prompt_tokens + n_audio_tokens + max_new_tokens + 8)`(8 为余量;fireredasr 同款 `min(max_len, estimated + 4)` 思路)。逐流分配替代固定 2048;CPU 路径同样受益(分配更小)。注意 decoder 输入 shape 是动态轴,ORT 侧无需改动。
 
-- [ ] **Step 2: 构建 + 验证 + 部署 + A/B(同 Task 6 Step 3-5)**
+- [x] **Step 2: 构建 + 验证 + 部署 + A/B(同 Task 6 Step 3-5)**
 
 文本必须仍与 Phase 1 fp32 文本逐字节一致;记录 RTF/显存;fork commit + push。
 
-- [ ] **Step 3: 补一条长音频验证**
+- [x] **Step 3: 补一条长音频验证**
 
 从 `~/lan-share/files/` 挑一条 ≥10min 的非中文音频(或拼接 en_90s),lang=other 走生产 jobs,确认:无 OOM、文本连贯、显存峰值记录。
 
@@ -248,10 +250,10 @@ Expected: en_90s 级长音频明显提速(210GB H2D 消除);短音频小幅提�
 - Modify: `AGENTS.md`(Local work notes 加一行摘要,附关键数字)
 - Modify(远端): `/home/kn/asr-service/README.md`(other 链路章节:fp32 模型、显存、回滚方法)
 
-- [ ] **Step 1: 写优化文档**(全部实测数字落盘,含 Phase 1/2/3 各自的 RTF/显存/文本验证结果)
-- [ ] **Step 2: 更新 AGENTS.md 摘要行**
-- [ ] **Step 3: fork commit + push(`fireredasr-batch-decoding`);asr README 部署到远端**
-- [ ] **Step 4: 终验报告给用户**:三阶段累计加速比、最终 RTF、显存、文本验收结论、回滚指引
+- [x] **Step 1: 写优化文档**(全部实测数字落盘,含 Phase 1/2/3 各自的 RTF/显存/文本验证结果)
+- [x] **Step 2: 更新 AGENTS.md 摘要行**
+- [x] **Step 3: fork commit + push(`fireredasr-batch-decoding`);asr README 部署到远端**
+- [x] **Step 4: 终验报告给用户**:三阶段累计加速比、最终 RTF、显存、文本验收结论、回滚指引
 
 ---
 
