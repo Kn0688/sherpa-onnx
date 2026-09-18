@@ -4,6 +4,8 @@
 
 #include "sherpa-onnx/csrc/offline-qwen3-asr-model.h"
 
+#include "sherpa-onnx/csrc/ort-env.h"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -122,7 +124,7 @@ class OfflineQwen3ASRModel::Impl {
  public:
   explicit Impl(const OfflineModelConfig &config)
       : config_(config),
-        env_(ORT_LOGGING_LEVEL_ERROR, "qwen3-asr"),
+        env_(CreateOrtEnv()),
         sess_opts_conv_(GetSessionOptions(config)),
         sess_opts_encoder_(GetSessionOptions(config)),
         sess_opts_decoder_(GetSessionOptions(config)),
@@ -153,7 +155,7 @@ class OfflineQwen3ASRModel::Impl {
   template <typename Manager>
   Impl(Manager *mgr, const OfflineModelConfig &config)
       : config_(config),
-        env_(ORT_LOGGING_LEVEL_ERROR, "qwen3-asr"),
+        env_(CreateOrtEnv()),
         sess_opts_conv_(GetSessionOptions(config)),
         sess_opts_encoder_(GetSessionOptions(config)),
         sess_opts_decoder_(GetSessionOptions(config)),
