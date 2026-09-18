@@ -16,12 +16,13 @@
 | fork fp16 + 逐句（MAX_BATCH=0） | 0.098 | 优化二，累计 3.2× |
 | fork **fp32 encoder + fp16 decoder + 逐句** | **0.036** | 优化三（换模型文件），累计 **8.8×** |
 | fork fp32 encoder + fp16 decoder + 逐句 + **禁 BFC arena** | **0.037** | 优化四（fork 首个 CUDA 代码改动），根治长任务 OOM，累计 **8.6×** |
+| fork **fp32 encoder + fp32 decoder + 批量 8 + 硬切 20s + 禁 arena** | **0.027** | 批量复活（服务端硬切+攒批，fork 零改动），累计 **11.8×** |
 
-- 对照参照系：iOS MLX 4h 长音频 RTF ≈ 0.125 —— 服务端反超手机端后进一步拉开到 ~3.5×
-- **3h48 长音频终验**：fp16 1720s(RTF 0.126)→ fp32+arena 56% 处 OOM → **fp32+禁 arena 797s 完成（RTF 0.057，比 fp16 快 2.2×）**，显存锯齿 4337~4797 MiB 用多少占多少，结束回落；74514 字，与 8 月旧版结果去标点相似度 94.9%（与 fp16 链路的 95.2% 同档，正常数值漂移）
+- 对照参照系：iOS MLX 4h 长音频 RTF ≈ 0.125 —— 服务端反超手机端后进一步拉开到 ~4.6×
+- **3h48 长音频终验**：fp16 1720s(RTF 0.126)→ fp32+arena 56% 处 OOM → fp32+禁 arena 797s(RTF 0.057)→ **批量链路 858s(RTF 0.061，比 fp16 快 2.0×；比逐句慢 7%——长段被帧预算压缩，但短音频快 42%，按用户决策采纳）**，显存峰值 5420 MiB 无 OOM；74597 字，与逐句链路文本相似度 99.89%（差异仅在 3 个硬切口附近）
 - 精度：160s / 800 字文本 md5 三轮全同（`8bd84d39…`），fp32 与 fp16/int8 链路**逐字节一致**，零损失
-- 显存峰值：fp32 链路 160s job 4365 MiB（禁 arena）/ 5337 MiB（arena）
-- **2026-09-18 批量复活实验（技术成立、未采纳）**：批量路径本就 GPU-resident（"每步 PCIe 搬运税"的前提证伪，见 §8）；fp32 decoder + 长度感知攒批 160s RTF 0.026（1.42×）且 md5 一致，但 6GB 卡上必须把 VAD 截到 10s 才安全（20s+ 巨段单跑都会 OOM）——按"截断不变"约束未采纳，已回退。**6GB 卡上批量方向关闭**
+- 显存峰值：fp32 链路 160s job 4365 MiB（逐句）/ 5232 MiB（批量 8），均禁 arena；3h48 峰值 5420 MiB
+- **2026-09-18 批量复活（已采纳）**：批量路径本就 GPU-resident（"每步 PCIe 搬运税"的前提证伪，见 §8）；真瓶颈是 fp16 decoder GEMM 在 N≥4 慢 ~6×。最终方案：fp32 decoder + 长度感知攒批（3000 帧×N 预算）+ **服务端硬切 20s**（VAD `max_speech_duration` 是软上限，连续语音实测冲到 27.65s；硬切在 19-20s 窗口找能量最低点递归切分，零样本丢失）。曾因需截断到 10s 被拒，硬切把截断影响收敛到超长段本身（3h48 仅 3 段触发）后采纳
 - **2026-09-17 decoder CUDA Graph 实验：已实现、验证、移除**。墙钟零收益（生产 decoder 早已 GPU-resident 6.1ms/步），3h48 长任务反而 +4.6%，双路径复杂度不抵收益，代码已移除（见死路清单）。fork C++ 保持无功能性改动
 - **2026-09-17 重要更正**：此前"encoder 47% 墙钟消耗在 kernel 间隙"的结论是**测量错误**（ORT profiler 口径问题，见 §5）。真实根因是 fp16 GEMM 在无 tensor core 的 TU116 上比 fp32 慢 ~6×，直接催生了优化三
 
@@ -197,7 +198,7 @@ tensor-op math 无效（无 tensor core），ORT TunableOp 无效（396/397/397m
 
 fp32 encoder 落地后 160s decode 从 ~15s 降到 5.79s，encoder 占比大幅下降，decoder（fp16，逐句 6.1ms/步）成为相对大头。剩余方向按现状排序：
 
-1. ~~**fork C++ 批量路径 GPU-resident KV cache**~~ **（2026-09-18 前提证伪，方向关闭）**：读码+实测确认 fork 批量路径**本就 GPU-resident**（上游 `711acccd` 的 IOBinding 已在部署代码里：encoder cross K/V 直绑 CUDA 内存、decoder self-KV 零拷贝回喂，每步 PCIe 仅 tokens/offset ~128B + logits D2H N=8 时 277KB）。批量慢的真因仍是 **fp16 GEMM 在无 tensor core 卡上慢 ~6×**（N=8 时 decoder fp16 96.5ms/步 vs fp32 21.8ms/步；逐句 N=1 带宽 bound 所以 fp16 才对）。**批量复活实验（技术成立、未采纳）**：fp32 decoder + 长度感知攒批（3000 帧×N 预算，长段自动缩批）+ VAD zh 截 10s，160s RTF **0.026（比逐句 0.037 快 1.42×）**且 md5 逐字节一致；但 3h48 858s（比逐句 797s 慢 7%，长段被帧预算压缩 + N=1 步 fp32 慢 8%），且 fp32 decoder 静态 4.95GB 下余量仅 ~1.19GB，20s+ 巨段单跑需求 ~1.23GB（encoder 瞬时 780MB + cross K/V 360MB）——**截 20s 时逐句也顶穿，必须截 10s**。用户约束"截断不变"→ 不采纳、已回退；fp32 decoder 模型与攒批 diff 留存远端（`~/firered-work`、asr-service 备份），换 ≥8GB 显存的卡可直接启用。**关键机制认知**：silero `max_speech_duration` 是软上限不是硬切（`voice-activity-detector.cc:50-65`：超时后 threshold 0.5→0.9、min_silence 0.25→0.1，找切点但不硬切），连续语音实测可长至 27.65s——显存规划必须按"段长无硬顶"做
+1. ~~**fork C++ 批量路径 GPU-resident KV cache**~~ **（2026-09-18 前提证伪 → 同日以另一形态落地，已上线）**：读码+实测确认 fork 批量路径**本就 GPU-resident**（上游 `711acccd` 的 IOBinding 已在部署代码里：encoder cross K/V 直绑 CUDA 内存、decoder self-KV 零拷贝回喂，每步 PCIe 仅 tokens/offset ~128B + logits D2H N=8 时 277KB）。批量慢的真因仍是 **fp16 GEMM 在无 tensor core 卡上慢 ~6×**（N=8 时 decoder fp16 96.5ms/步 vs fp32 21.8ms/步；逐句 N=1 带宽 bound 所以 fp16 才对）。**落地形态（全部服务端改动，fork 零改动）**：fp32 decoder + 长度感知攒批（3000 帧×N 预算，长段自动缩批）+ **硬切 20s**（VAD 分段后 >20s 的段在 19-20s 窗口找 50ms 帧能量最低点递归切开，单元自测零样本丢失、时间戳连续）。实测：160s RTF **0.027**（逐句 0.037 的 1.4×，md5 逐字节一致，硬切不触发）；3h48 858s/RTF 0.061（比逐句 797s 慢 7%，长段被帧预算压缩 + N=1 步 fp32 慢 8%；比 fp16 时代 1720s 快 2.0×），74597 字，与逐句链路相似度 99.89%（3 个硬切口），VRAM 峰值 5420 MiB 无 OOM。**关键机制认知**：silero `max_speech_duration` 是软上限不是硬切（`voice-activity-detector.cc:50-65`：超时后 threshold 0.5→0.9、min_silence 0.25→0.1，找切点但不硬切），连续语音实测可长至 27.65s——显存规划必须按"段长无硬顶"做，这正是硬切的由来。教训：先以"截 10s"形态被拒（影响所有 10-20s 段），把截断收敛为只影响超长段本身的硬切后才可接受——**约束的形态决定方案的可采纳性**
 2. **decoder 逐句形态进一步压缩**：N=1 带宽 bound 下，减少每步权重读取是唯一方向（权重 int8 量化只省带宽不要 int8 GEMM——TU116 上 int8 无硬件加速但字节数减半，待测；注意与 §2 分离式 int8 的 memcpy 坑区分，这里指 weight-only QDQ 类方案）。禁 arena 后 decoder 每步还有 +11% 的真实分配开销，自定义轻量 pool 分配器是潜在回收点
 3. **encoder 侧**：fp32 后 T=500 仅 66ms，绝对空间已小；0 个 com.microsoft 融合节点（相对位置编码注意力不匹配 ORT MHA fusion pattern）的问题仍在，但生产均值段 T≈311 下收益有限，优先级低
 4. **阶段 B（ORT 源码级）**：最大杠杆（fp16 GEMM 死局）已被 fp32 绕过；显存封顶需求已被禁 arena 解决（§6）。剩余可选：量化外围算子 GPU 化（仅当 decoder 走 int8 权重路径时相关）
